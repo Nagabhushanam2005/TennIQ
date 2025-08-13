@@ -4,7 +4,9 @@ __pycache__/
 *$py.class
 
 *.jpg
-
+*.mp4
+data/web-scrapping/videofeed
+tenniq_venv/
 
 
 # C extensions

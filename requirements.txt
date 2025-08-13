@@ -1,2 +1,5 @@
-pytube==15.0.0
-yt-dlp==2025.7.21
+pytube
+yt-dlp
+numpy
+opencv-python
+argparse
