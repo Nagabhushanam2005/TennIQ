@@ -1,0 +1,16 @@
+# TennIQ Configuration File
+
+# General Settings
+FPS=30
+SHOW_DISPLAY=true
+SAVE_OUTPUT=false
+OUTPUT_PATH="/dev/null"
+
+# Tracking Options (true/false)
+ENABLE_BALL_TRACKING=true
+ENABLE_PLAYER_TRACKING=true
+ENABLE_COURT_TRACKING=true
+
+# Detection Thresholds
+BALL_CONFIDENCE=0.3
+BALL_TRAJECTORY_LENGTH=30

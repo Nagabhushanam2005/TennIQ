@@ -3,3 +3,7 @@ yt-dlp
 numpy
 opencv-python
 argparse
+scipy
+matplotlib
+scikit-learn
+filterpy
