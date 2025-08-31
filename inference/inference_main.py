@@ -210,7 +210,7 @@ class TennisAnalyzer:
 
         # 1. Ball Tracking
         if self.enable_ball_tracking and self.ball_tracker:
-            self.ball_tracker.update()
+            self.ball_tracker.update(frame=frame)
 
         result_frame = self._draw_annotations(result_frame)
 
@@ -224,7 +224,7 @@ class TennisAnalyzer:
 
         # 1. Mark ball position
         if self.enable_ball_tracking and self.ball_tracker:
-            result_frame = self.ball_tracker.draw_ball(result_frame)
+            result_frame = self.ball_tracker.draw_ball(result_frame,)
 
         return result_frame
 

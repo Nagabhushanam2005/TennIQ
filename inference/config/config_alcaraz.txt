@@ -14,3 +14,5 @@ ENABLE_COURT_TRACKING=true
 # Detection Thresholds
 BALL_CONFIDENCE=0.3
 BALL_TRAJECTORY_LENGTH=30
+
+MODEL_PATH=models/tracknet.h5
