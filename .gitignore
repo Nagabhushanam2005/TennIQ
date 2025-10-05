@@ -7,7 +7,10 @@ __pycache__/
 *.mp4
 data/web-scrapping/videofeed
 tenniq_venv/
-
+yolo_train/yolo_dataset
+yolo_train/dataset
+yolo_train/player_detection
+yolo_train/yolo11n.pt
 
 # C extensions
 *.so
