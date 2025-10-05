@@ -33,7 +33,25 @@ def download_youtube_video(url, output_path):
     
     print(f"Downloading video to {output_path} ...")
     try:
-        subprocess.run(['yt-dlp', '-f', 'best[ext=mp4]', '-o', output_path, url], check=True)
+        # subprocess.run(['yt-dlp', '-U'], check=True)
+
+        cmd = [
+            'yt-dlp',
+            '-f', 'bv*+ba/best',
+            '--merge-output-format', 'mp4',
+            '-o', output_path,
+            url
+        ]
+        try:
+            subprocess.run(cmd, check=True)
+        except subprocess.CalledProcessError:
+            print("Primary download failed, retrying with fallback...")
+            subprocess.run([
+                'yt-dlp',
+                '-f', 'best',
+                '-o', output_path,
+                url
+            ], check=True)
         print("Download complete.")
     except subprocess.CalledProcessError as e:
         print(f"Error downloading video: {e}")

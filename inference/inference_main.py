@@ -15,6 +15,9 @@ import time
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
+from inference.src.court_detector import CourtDetector
+from inference.src.court_reference import CourtReference
+
 from inference.src.player_tracker import PlayerTracker
 from inference.src.ball_tracker import BallTracker
 from inference.src.tennis_event_detection import TennisEventDetector
@@ -36,10 +39,10 @@ class TennisAnalyzer:
         # Initialize config
         self.enable_ball_tracking = self.config.get("ENABLE_BALL_TRACKING", True)
         self.enable_player_tracking = self.config.get("ENABLE_PLAYER_TRACKING", True)
-        self.enable_court_tracking = self.config.get(
-            "ENABLE_COURT_TRACKING", True
-        )  # Yet to be implemented
-
+        self.enable_court_tracking = self.config.get("ENABLE_COURT_TRACKING", True)
+        self.calib_frames = self.config.get("CALIB_FRAMES", 30)
+        self.court_homography_path = self.config.get("COURT_HOMOGRAPHY_PATH", "court_homography_matrices.npz")
+        
         # Event detection only if all tracking is enabled
         self.enable_event_detection = (
             self.enable_ball_tracking
@@ -47,9 +50,16 @@ class TennisAnalyzer:
             and self.enable_court_tracking
         )
 
+        # --- Integrated Court Detection/Tracking ---
+        self.court_warp_matrix: Optional[np.ndarray] = None
+        self.game_warp_matrix: Optional[np.ndarray] = None
+        self.court_lines_frame_coords: Optional[np.ndarray] = None
+
         if self.enable_player_tracking:
             # TODO
-            pass
+            self.player_tracker = PlayerTracker()
+        else:
+            self.player_tracker = None
 
         if self.enable_ball_tracking:
             self.ball_tracker = BallTracker()
@@ -58,12 +68,15 @@ class TennisAnalyzer:
             self.ball_tracker = None
 
         if self.enable_court_tracking:
-            # TODO
-            pass
+            self.court_detector = CourtDetector(verbose=0)
+        else:
+            self.court_detector = None
 
         if self.enable_event_detection:
             # TODO
-            pass
+            self.event_detector = TennisEventDetector()
+        else:
+            self.event_detector = None
 
         # State
         self.frame_count = 0
@@ -93,7 +106,7 @@ class TennisAnalyzer:
                                 if value.lower() in ["true", "false"]:
                                     config[key] = value.lower() == "true"
                                 # Convert numeric strings
-                                elif value.replace(".", "").isdigit():
+                                elif value.replace(".", "").replace("-", "").isdigit():
                                     config[key] = (
                                         float(value) if "." in value else int(value)
                                     )
@@ -107,6 +120,82 @@ class TennisAnalyzer:
             logger.error(f"Error loading config: {e}")
         return config
 
+    def _calibrate_court(self, cap: cv2.VideoCapture, total_frames: int) -> None:
+        """
+        Calibrate the court by processing the initial frames. 
+        Assumes static camera after calibration.
+        """
+        if not self.enable_court_tracking or not self.court_detector:
+            logger.info("Court tracking disabled. Skipping calibration.")
+            return
+
+        logger.info(f'Starting court calibration on the first {self.calib_frames} frames...')
+        
+        # Reset to frame 0 for calibration
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        
+        # Try to load existing homography matrices
+        if os.path.exists(self.court_homography_path):
+            try:
+                data = np.load(self.court_homography_path)
+                self.court_warp_matrix = data['court_warp_matrix']
+                self.game_warp_matrix = data['game_warp_matrix']
+                
+                # Re-run detection on the first frame to get the line coordinates for drawing
+                ret, frame = cap.read()
+                if ret:
+                    # Manually warp the reference points to get frame coordinates
+                    court_ref = self.court_detector.court_reference
+                    p = np.array(court_ref.get_important_lines(), dtype=np.float32).reshape((-1, 1, 2))
+                    self.court_lines_frame_coords = cv2.perspectiveTransform(p, self.court_warp_matrix).reshape(-1)
+                
+                logger.info(f"Loaded court homography from {self.court_homography_path}. Skipping calibration.")
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0) # Reset video
+                return
+            except Exception as e:
+                logger.warning(f"Failed to load homography from {self.court_homography_path}: {e}. Recalibrating.")
+
+        
+        successful_detections = 0
+        for frame_i in range(1, self.calib_frames + 1):
+            ret, frame = cap.read()
+            if not ret:
+                break
+                
+            # Full detection on the first frame, then track/refine
+            if frame_i == 1:
+                lines = self.court_detector.detect(frame)
+            else:
+                lines = self.court_detector.track_court(frame)
+
+            if self.court_detector.success_flag and lines is not None:
+                successful_detections += 1
+                self.court_lines_frame_coords = lines
+                self.court_warp_matrix = self.court_detector.court_warp_matrix[-1]
+                self.game_warp_matrix = self.court_detector.game_warp_matrix[-1]
+
+            logger.info(f'Calibration Frame: {frame_i}/{self.calib_frames} (Successes: {successful_detections})', end='\r')
+        
+        # Reset video to start
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        self.frame_count = 0 
+        
+        if self.court_warp_matrix is not None:
+            logger.info("\nCourt calibration finalized. Saving homography.")
+            # Save the final homography matrices
+            try:
+                np.savez(self.court_homography_path, 
+                         court_warp_matrix=self.court_warp_matrix, 
+                         game_warp_matrix=self.game_warp_matrix,
+                         best_conf=self.court_detector.best_conf)
+                logger.info(f"Final homography matrices saved to: {self.court_homography_path}")
+            except Exception as e:
+                logger.error(f"Failed to save homography matrices: {e}")
+        else:
+            logger.error("\nCourt calibration failed on all frames.")
+            self.enable_court_tracking = False
+            self.enable_event_detection = False
+            
     def analyze_video(self, video_path: str) -> None:
         """
         Analyze tennis video with comprehensive tracking
@@ -132,6 +221,10 @@ class TennisAnalyzer:
         logger.info(
             f"Video: {frame_width}x{frame_height}, {self.fps} FPS, {total_frames} frames"
         )
+        
+        # --- Court Calibration (New Integration) ---
+        self._calibrate_court(cap, total_frames)
+        # -------------------------------------------
 
         out_writer = None
         if self.save_output and self.output_path:
@@ -143,13 +236,14 @@ class TennisAnalyzer:
         start_time = time.time()
 
         try:
+            # The capture is now reset to frame 0 after calibration
             while True:
                 ret, frame = cap.read()
                 if not ret:
                     break
 
                 self.frame_count += 1
-
+                
                 # Perform analysis
                 result_frame = self._analyze_frame(frame)
 
@@ -208,9 +302,20 @@ class TennisAnalyzer:
         """
         result_frame = frame.copy()
 
-        # 1. Ball Tracking
+        # 1. Player Tracking (If Court is ready)
+        if self.enable_player_tracking and self.player_tracker and self.court_warp_matrix is not None:
+            # TODO: Add player tracking call here
+            self.player_tracker.update(frame, self.court_warp_matrix)
+
+        # 2. Ball Tracking
         if self.enable_ball_tracking and self.ball_tracker:
-            self.ball_tracker.update()
+            # NOTE: Ball tracker's update logic depends on its internal model/queue
+            self.ball_tracker.update(frame) 
+
+        # 3. Event Detection
+        if self.enable_event_detection and self.event_detector:
+            # TODO: Add event detection call here
+            self.event_detector.update()
 
         result_frame = self._draw_annotations(result_frame)
 
@@ -225,11 +330,25 @@ class TennisAnalyzer:
         # 1. Mark ball position
         if self.enable_ball_tracking and self.ball_tracker:
             result_frame = self.ball_tracker.draw_ball(result_frame)
+            
+        # 2. Mark court lines (New Integration)
+        if self.enable_court_tracking and self.court_lines_frame_coords is not None:
+            lines = self.court_lines_frame_coords
+            for i in range(0, len(lines), 4):
+                x1, y1, x2, y2 = lines[i],lines[i+1], lines[i+2], lines[i+3]
+                # Draw lines in White (255, 255, 255)
+                cv2.line(result_frame, (int(x1),int(y1)),(int(x2),int(y2)), (255, 255, 255), 2)
+                
+        # 3. Mark players
+        if self.enable_player_tracking and self.player_tracker:
+            # TODO: Add player drawing call here
+            result_frame = self.player_tracker.draw_players(result_frame)
+
 
         return result_frame
 
     def _draw_info_overlay(self, frame: np.ndarray) -> np.ndarray:
-        """Draw information overlay on frame"""
+        # ... (implementation of _draw_info_overlay remains the same as original)
         result_frame = frame.copy()
 
         # Info panel background
@@ -301,8 +420,9 @@ class TennisAnalyzer:
             1,
         )
         return result_frame
-
+    
     def _print_analysis_summary(self):
+        # ... (implementation of _print_analysis_summary remains the same as original)
         print("\n" + "=" * 50)
         print("TENNIS ANALYSIS SUMMARY")
         print("=" * 50)
@@ -313,22 +433,23 @@ class TennisAnalyzer:
         print(f"Event detection: {self.enable_event_detection}")
 
         if self.enable_court_tracking and self.court_detector:
-            pass
+            print("Court tracking done and calibrated.")
 
         if self.enable_player_tracking and self.player_tracker:
-            pass
+            print(f"Player tracking done")
 
         if self.enable_ball_tracking and self.ball_tracker:
             print(f"Ball tracking done")
 
         if self.enable_event_detection and self.event_detector:
-            pass
+            print(f"Event detection done")
 
         print("=" * 50)
-
+        
     def analyze_image_sequence(self, image_dir: str) -> None:
         """
         Analyze sequence of images (e.g., extracted frames)
+        NOTE: Court calibration must be done externally/via config loading for this mode.
 
         Args:
             image_dir: Directory containing image sequence
@@ -336,7 +457,11 @@ class TennisAnalyzer:
         if not os.path.exists(image_dir):
             logger.error(f"Image directory not found: {image_dir}")
             return
-
+            
+        # NOTE: In image sequence mode, we assume the homography is loaded via config/file
+        # or the user expects the court to be detected only once on the first frame
+        # which is handled by the first call to analyze_frame in the loop if self.court_warp_matrix is None.
+        
         # Get image files
         image_files = []
         for ext in ["*.jpg", "*.jpeg", "*.png"]:
@@ -357,6 +482,14 @@ class TennisAnalyzer:
                 continue
 
             self.frame_count = i + 1
+            
+            # Perform initial court detection on the first frame if not already loaded
+            if self.enable_court_tracking and self.court_warp_matrix is None:
+                self.court_detector.detect(frame)
+                self.court_lines_frame_coords = self.court_detector.lines
+                self.court_warp_matrix = self.court_detector.court_warp_matrix[-1]
+                self.game_warp_matrix = self.court_detector.game_warp_matrix[-1]
+
             result_frame = self._analyze_frame(frame)
 
             if self.show_display:
@@ -394,6 +527,13 @@ def main():
         default="video",
         help="Analysis mode: video file or image sequence",
     )
+    # Add an optional argument for calibration frames, which can also be in the config
+    parser.add_argument(
+        "--calib-frames",
+        type=int,
+        default=None,
+        help="Override the number of calibration frames specified in the config",
+    )
 
     args = parser.parse_args()
 
@@ -401,9 +541,12 @@ def main():
     analyzer = TennisAnalyzer(args.config)
     analyzer.show_display = not args.no_display
 
+    # Apply command line overrides
     if args.output:
         analyzer.save_output = True
         analyzer.output_path = args.output
+    if args.calib_frames is not None:
+        analyzer.calib_frames = args.calib_frames
 
     # Run
     try:
@@ -418,4 +561,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

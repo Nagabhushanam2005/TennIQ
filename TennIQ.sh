@@ -44,8 +44,7 @@ scipy
 matplotlib
 scikit-learn
 filterpy
-ultralyticsplus==0.1.0
-ultralytics==8.0.239
+ultralytics
 EOF
     fi
 
@@ -53,7 +52,7 @@ EOF
         echo "Virtual environment already exists. Activating..."
     else
         echo "Creating virtual environment..."
-        python3 -m venv tenniq_venv
+        $PYTHON_EXEC -m venv tenniq_venv
     fi
 
     source tenniq_venv/bin/activate
@@ -72,6 +71,13 @@ INPUT_FILE=""
 OUTPUT_FILE=""
 NO_DISPLAY=""
 MODE="video"
+
+
+if [[ -z "$PYTHON_EXEC" ]]; then
+    echo "Error: Please export PYTHON_EXEC with your Python executable path (e.g., export PYTHON_EXEC=python3)"
+    exit 1
+fi
+$PYTHON_EXEC data/web-scrapping/web-scrapping.py --config "$CONFIG_FILE"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -178,10 +184,10 @@ if [[ "$ACTION" == "setup" ]]; then
     setup
 elif [[ "$ACTION" == "import" ]]; then
     echo "Importing video from YouTube..."
-    python3 data/web-scrapping/web-scrapping.py --config "$CONFIG_FILE"
+    $PYTHON_EXEC data/web-scrapping/web-scrapping.py --config "$CONFIG_FILE"
 elif [[ "$ACTION" == "infer" ]]; then
     echo "Running tennis analysis inference..."
-    INFER_CMD="python3 -m inference.inference_main --input \"$INPUT_FILE\" --mode $MODE"
+    INFER_CMD="$PYTHON_EXEC -m inference.inference_main --input \"$INPUT_FILE\" --mode $MODE"
     [[ -n "$CONFIG_FILE" ]] && INFER_CMD="$INFER_CMD --config \"$CONFIG_FILE\""
     [[ -n "$OUTPUT_FILE" ]] && INFER_CMD="$INFER_CMD --output \"$OUTPUT_FILE\""
     [[ -n "$NO_DISPLAY" ]] && INFER_CMD="$INFER_CMD $NO_DISPLAY"
@@ -189,7 +195,7 @@ elif [[ "$ACTION" == "infer" ]]; then
     eval $INFER_CMD
 elif [[ "$ACTION" == "demo" ]]; then
     echo "Running demo analysis..."
-    FRAMES_DIR="data/web-scrapping/frames_alcaraz"
+    FRAMES_DIR="data/web-scrapping/frames_test"
     if [[ ! -d "$FRAMES_DIR" ]]; then
         echo "Error: Frames directory not found: $FRAMES_DIR"
         echo "Please run: $0 --import -c <config_file> first"
@@ -197,7 +203,7 @@ elif [[ "$ACTION" == "demo" ]]; then
     fi
     
     if [[ -z "$CONFIG_FILE" ]]; then
-        CONFIG_FILE="inference/config/config_alcaraz.txt"
+        CONFIG_FILE="inference/config/config_test.txt"
     fi
-    python3 -m inference.inference_main --config "$CONFIG_FILE" --input "$FRAMES_DIR" --mode images
+    $PYTHON_EXEC -m inference.inference_main --config "$CONFIG_FILE" --input "$FRAMES_DIR" --mode images
 fi
