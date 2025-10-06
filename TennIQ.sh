@@ -74,8 +74,8 @@ MODE="video"
 
 
 if [[ -z "$PYTHON_EXEC" ]]; then
-    echo "Error: Please export PYTHON_EXEC with your Python executable path (e.g., export PYTHON_EXEC=python3)"
-    exit 1
+    echo "Warning: PYTHON_EXEC environment variable not set. Defaulting to 'python3'."
+    PYTHON_EXEC="python3"
 fi
 $PYTHON_EXEC data/web-scrapping/web-scrapping.py --config "$CONFIG_FILE"
 
@@ -205,5 +205,5 @@ elif [[ "$ACTION" == "demo" ]]; then
     if [[ -z "$CONFIG_FILE" ]]; then
         CONFIG_FILE="inference/config/config_test.txt"
     fi
-    $PYTHON_EXEC -m inference.inference_main --config "$CONFIG_FILE" --input "$FRAMES_DIR" --mode images
+    $PYTHON_EXEC -m inference.inference_main --config "$CONFIG_FILE" --input "$FRAMES_DIR" --mode images --player-model "yolo_train/player_detection/yolo11n_player_finetune4/weights/best.pt"
 fi
