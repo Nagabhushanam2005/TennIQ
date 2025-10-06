@@ -58,31 +58,13 @@ class Player:
                 (self.box_history[-1] if self.box_history else None)
 
     def predict_next_position(self) -> Tuple[float, float]:
-        """Predict next position based on velocity history using exponential weighting."""
+        """Predict next position based on velocity history using exponential weighting. MODIFIED: Returns last known position (No Prediction)."""
         if not self.position_history:
             return (0.0, 0.0)
 
-        if not self.velocity_history:
-            return (float(self.position_history[-1][0]), float(self.position_history[-1][1]))
-
-        vel_hist = list(self.velocity_history)
-
-        window = vel_hist[-50:] # Use last 50 velocities
-        n = len(window)
-        
-        if self.exponential_prediction_weight > 0 and n > 0:
-            weights = np.exp(np.linspace(-self.exponential_prediction_weight, 0, n))
-            weights /= weights.sum()
-            avg_velocity = np.average(window, axis=0, weights=weights)
-        else:
-            avg_velocity = window[-1] if n > 0 else (0, 0)
-
-
-        predicted_pos = (
-            self.position_history[-1][0] + avg_velocity[0],
-            self.position_history[-1][1] + avg_velocity[1]
-        )
-        return predicted_pos
+        # Simply return the last known position
+        last_pos = self.position_history[-1]
+        return (float(last_pos[0]), float(last_pos[1]))
         
     def get_average_velocity(self):
         if len(self.velocity_history) == 0:
@@ -144,7 +126,9 @@ class PlayerTracker:
         self.exponential_prediction = exponential_prediction
         self.next_player_id = 0
         self.player_trackers: List[Player] = []
-        self.active_players: List[Player] = [] 
+        self.active_players: List[Player] = []
+        self.recalibrating = False
+        self.recalib_frame_count = 0
         self.frame_count = 0
         self.calibration_done = False
         self.calibration_max_frames = 30 # Default, overridden by inference_main config
@@ -178,11 +162,73 @@ class PlayerTracker:
             self._calibration_update(person_detections)
             return []
         else:
+
+            # Recalibration Check
+            if not self.recalibrating and not self.active_players and self.frame_count % 30 == 0:
+                logger.info("All active players lost. Starting 10-frame re-calibration.")
+                self.recalibrating = True
+                self.recalib_frame_count = 0
+                self.player_trackers = []
+
+            if self.recalibrating:
+                self._temporary_recalibration_update(person_detections)
+
+            # Main Tracking Phase
             self._main_tracking_update(frame, person_detections)
             
             # TODO: Convert to court coordinates using court_warp_matrix if required
-            # For now, just return the list of active players
             return self.active_players
+
+
+    def _temporary_recalibration_update(self, person_detections: List[Tuple[float, Tuple[int, int, int, int], Tuple[int, int]]]):
+        """Internal method for running a short re-calibration window."""
+
+        self.recalib_frame_count += 1
+        used_detections = set()
+
+        for tracker in self.player_trackers:
+            best_detection = None
+            min_dist = self.max_distance + 1
+            last_pos, _, _ = tracker.current_position()
+
+            for idx, (conf, box, center) in enumerate(person_detections):
+                if idx in used_detections:
+                    continue
+
+                dist = calculate_distance(last_pos, center)
+
+                if dist < min_dist:
+                    min_dist = dist
+                    best_detection = (conf, box, center)
+
+            if best_detection is not None and min_dist <= self.max_distance:
+                conf, box, center = best_detection
+                tracker.update_position(center, conf, box, self.frame_count)
+                used_detections.add(idx)
+            else:
+                tracker.frames_lost += 1
+
+        for idx, (conf, box, center) in enumerate(person_detections):
+            if idx not in used_detections:
+                new_tracker = Player(center, self.next_player_id, box, conf, exponential_prediction=self.exponential_prediction)
+                self.player_trackers.append(new_tracker)
+                self.next_player_id += 1
+
+        if self.recalib_frame_count >= 10: # Stop after 10 frames
+            logger.info("Re-calibration finished. Selecting new active players.")
+            self._finalize_recalibration()
+
+    def _finalize_recalibration(self):
+        """Selects the top 2 players after a temporary re-calibration."""
+        active_calib_trackers = [t for t in self.player_trackers if t.frames_lost < self.max_lost_frames]
+        if active_calib_trackers:
+            active_calib_trackers.sort(key=lambda t: t.total_movement, reverse=True)
+            self.active_players = active_calib_trackers[:self.max_players]
+            logger.info(f"Re-calibration complete. Selected {len(self.active_players)} new active player(s).")
+        else:
+            logger.warning("Re-calibration failed to select any active players.")
+
+        self.recalibrating = False
 
     def _calibration_update(self, person_detections: List[Tuple[float, Tuple[int, int, int, int], Tuple[int, int]]]):
         used_detections = set()
@@ -191,15 +237,13 @@ class PlayerTracker:
             best_detection = None
             min_dist = self.max_distance + 1
             best_idx = -1
-            predicted_pos = tracker.predict_next_position() # Use prediction for matching
+            last_pos, _, _ = tracker.current_position()
             
             for idx, (conf, box, center) in enumerate(person_detections):
                 if idx in used_detections:
                     continue
 
-                dist_to_current = calculate_distance(tracker.position_history[-1], center)
-                dist_to_predicted = calculate_distance(predicted_pos, center)
-                dist = min(dist_to_current, dist_to_predicted)
+                dist = calculate_distance(last_pos, center)
 
                 if dist < min_dist:
                     min_dist = dist
@@ -240,6 +284,7 @@ class PlayerTracker:
             logger.warning("Calibration: No players selected despite detections.")
             
         self.calibration_done = True
+        
     def _main_tracking_update(self, frame: np.ndarray, person_detections: List[Tuple[float, Tuple[int, int, int, int], Tuple[int, int]]]):
 
         if not self.active_players:
@@ -256,7 +301,8 @@ class PlayerTracker:
         new_active_players = []
 
         for tracker in self.active_players:
-            predicted_pos = tracker.predict_next_position()
+            # Prediction removed: use last known position for matching
+            last_pos, _, _ = tracker.current_position()
             best_detection = None
             best_score = -1
             best_idx = -1
@@ -265,24 +311,17 @@ class PlayerTracker:
                 if idx in used_detections:
                     continue
                     
-                distance_to_current = calculate_distance(tracker.position_history[-1], center)
-                distance_to_predicted = calculate_distance(predicted_pos, center)
-                effective_distance = min(distance_to_current, distance_to_predicted)
+                distance_to_current = calculate_distance(last_pos, center)
+                
+                # Simplified score based on proximity and confidence (removed all prediction/movement metrics)
+                effective_distance = distance_to_current
                 
                 if effective_distance <= self.max_distance:
 
-                    confidence_score = confidence * 0.3
-                    distance_score = (1 - effective_distance / self.max_distance) * 0.2
-                    prediction_score = (1 - distance_to_predicted / self.max_distance) * 0.2
+                    confidence_score = confidence * 0.5
+                    distance_score = (1 - effective_distance / self.max_distance) * 0.5
                     
-                    movement_velocity = calculate_distance((0, 0), 
-                        (center[0] - tracker.position_history[-1][0], 
-                         center[1] - tracker.position_history[-1][1]))
-                    movement_score = min(1.0, movement_velocity / 15.0) * 0.2
-                    consistency_score = tracker.get_movement_consistency() * 0.1
-                    
-                    combined_score = (confidence_score + distance_score + 
-                                    prediction_score + movement_score + consistency_score)
+                    combined_score = confidence_score + distance_score
 
                     if combined_score > best_score:
                         best_score = combined_score
@@ -295,16 +334,21 @@ class PlayerTracker:
                 used_detections.add(best_idx)
                 new_active_players.append(tracker)
             else:
+                MIN_MOVEMENT_THRESHOLD = 1.0
+                is_stationary = tracker.get_average_velocity() < MIN_MOVEMENT_THRESHOLD
+
                 tracker.frames_lost += 1
                 if tracker.frames_lost <= self.max_lost_frames:
-                    predicted_pos = tracker.predict_next_position()
-                    last_pos, last_conf, last_box = tracker.current_position()
-                    if last_pos:
-                        tracker.update_position(predicted_pos, last_conf, last_box, self.frame_count)
-                        new_active_players.append(tracker)
-                        logger.debug(f"Player {tracker.player_id} tracked via prediction in frame {self.frame_count}")
-                    else:
-                         logger.debug(f"Player {tracker.player_id} lost and no history in frame {self.frame_count}")
+                    # Fallback to hold last known position
+                    current_pos, last_conf, last_box = tracker.current_position()
+                    if current_pos:
+                         # Use last known position and box, and artificially update the history 
+                         # with the same data to hold the position on the screen.
+                         tracker.position_history.append(current_pos)
+                         tracker.box_history.append(last_box)
+                         tracker.confidence_history.append(last_conf)
+                         new_active_players.append(tracker)
+                         logger.debug(f"Player {tracker.player_id} tracked via position hold. Frames lost: {tracker.frames_lost}")
 
                 logger.debug(f"Player {tracker.player_id} lost for {tracker.frames_lost}/{self.max_lost_frames} frames.")
 
@@ -371,7 +415,7 @@ class PlayerTracker:
                 avg_vel = tracker.get_average_velocity()
                 if self.calibration_done:
                     player_label = next((f"Player {j+1}" for j, p in enumerate(self.active_players) if p.player_id == tracker.player_id), "Unknown")
-                    label = f"{player_label}: {confidence:.2f} (v:{avg_vel:.1f})"
+                    label = f"{player_label}: {confidence:.2f}"
                 else:
                     label = f"T{tracker.player_id}: {confidence:.2f}"
                     

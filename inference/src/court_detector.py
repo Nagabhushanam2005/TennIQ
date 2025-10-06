@@ -304,7 +304,10 @@ class CourtDetector:
         Finds important lines location on frame
         """
         self.p = np.array(self.court_reference.get_important_lines(), dtype=np.float32).reshape((-1, 1, 2))
-        self.lines = cv2.perspectiveTransform(self.p, self.court_warp_matrix[-1]).reshape(-1)
+        if self.court_warp_matrix[-1] is None:
+            self.lines = None
+        else:
+            self.lines = cv2.perspectiveTransform(self.p, self.court_warp_matrix[-1]).reshape(-1)
         # self.baseline_top = lines[:4]
         # self.baseline_bottom = lines[4:8]
         # self.net = lines[8:12]

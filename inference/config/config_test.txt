@@ -9,7 +9,7 @@ OUTPUT_PATH="/dev/null"
 # Tracking Options (true/false)
 ENABLE_BALL_TRACKING=false
 ENABLE_PLAYER_TRACKING=true
-ENABLE_COURT_TRACKING=true
+ENABLE_COURT_TRACKING=false
 
 # Detection Thresholds
 BALL_CONFIDENCE=0.3
