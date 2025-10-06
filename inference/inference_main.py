@@ -1,8 +1,3 @@
-"""
-TennIQ Main Inference Module
-Comprehensive tennis analysis with player tracking, ball tracking, and event detection
-"""
-
 import argparse
 import cv2
 import numpy as np
@@ -18,7 +13,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from inference.src.court_detector import CourtDetector
 from inference.src.court_reference import CourtReference
 
-from inference.src.player_tracker import PlayerTracker
+from inference.src.player_tracker import PlayerTracker 
 from inference.src.ball_tracker import BallTracker
 from inference.src.tennis_event_detection import TennisEventDetector
 
@@ -36,13 +31,17 @@ class TennisAnalyzer:
         """
         self.config = self._load_config(config_path) if config_path else {}
 
-        # Initialize config
         self.enable_ball_tracking = self.config.get("ENABLE_BALL_TRACKING", True)
         self.enable_player_tracking = self.config.get("ENABLE_PLAYER_TRACKING", True)
         self.enable_court_tracking = self.config.get("ENABLE_COURT_TRACKING", True)
         self.calib_frames = self.config.get("CALIB_FRAMES", 30)
         self.court_homography_path = self.config.get("COURT_HOMOGRAPHY_PATH", "court_homography_matrices.npz")
         
+        self.player_max_distance = self.config.get("PLAYER_MAX_DISTANCE", 25)
+        self.player_max_lost_frames = self.config.get("PLAYER_MAX_LOST_FRAMES", 10)
+        self.player_exp_pred = self.config.get("PLAYER_EXPONENTIAL_PREDICTION", 1.0)
+        self.player_model_path = self.config.get("PLAYER_MODEL_PATH", 'yolo11n.pt')
+
         # Event detection only if all tracking is enabled
         self.enable_event_detection = (
             self.enable_ball_tracking
@@ -50,14 +49,17 @@ class TennisAnalyzer:
             and self.enable_court_tracking
         )
 
-        # --- Integrated Court Detection/Tracking ---
         self.court_warp_matrix: Optional[np.ndarray] = None
         self.game_warp_matrix: Optional[np.ndarray] = None
         self.court_lines_frame_coords: Optional[np.ndarray] = None
 
         if self.enable_player_tracking:
-            # TODO
-            self.player_tracker = PlayerTracker()
+            self.player_tracker = PlayerTracker(
+                model_path=self.player_model_path,
+                max_distance=self.player_max_distance,
+                max_lost_frames=self.player_max_lost_frames,
+                exponential_prediction=self.player_exp_pred
+            )
         else:
             self.player_tracker = None
 
@@ -105,11 +107,12 @@ class TennisAnalyzer:
                                 # Convert boolean strings
                                 if value.lower() in ["true", "false"]:
                                     config[key] = value.lower() == "true"
-                                # Convert numeric strings
+                                # Convert numeric strings (allows float for exp_pred)
                                 elif value.replace(".", "").replace("-", "").isdigit():
-                                    config[key] = (
-                                        float(value) if "." in value else int(value)
-                                    )
+                                    if "." in value:
+                                        config[key] = float(value)
+                                    else:
+                                        config[key] = int(value)
                                 else:
                                     config[key] = value
 
@@ -122,80 +125,108 @@ class TennisAnalyzer:
 
     def _calibrate_court(self, cap: cv2.VideoCapture, total_frames: int) -> None:
         """
-        Calibrate the court by processing the initial frames. 
-        Assumes static camera after calibration.
+        Calibrate the court and also perform player tracking calibration by processing the initial frames. 
         """
+        calib_frames = min(self.calib_frames, total_frames)
+        if self.enable_player_tracking and self.player_tracker:
+            self.player_tracker.calibration_max_frames = calib_frames
+            logger.info(f"Setting player tracker calibration frames to {calib_frames}")
+
         if not self.enable_court_tracking or not self.court_detector:
-            logger.info("Court tracking disabled. Skipping calibration.")
+            logger.info("Court tracking disabled. Skipping court calibration.")
+            
+            if self.enable_player_tracking and self.player_tracker:
+                self._run_player_calibration(cap, calib_frames)
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                self.frame_count = 0 
             return
 
-        logger.info(f'Starting court calibration on the first {self.calib_frames} frames...')
+        logger.info(f'Starting court and player calibration on the first {calib_frames} frames...')
         
-        # Reset to frame 0 for calibration
-        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-        
-        # Try to load existing homography matrices
+        court_calibrated = False
         if os.path.exists(self.court_homography_path):
             try:
                 data = np.load(self.court_homography_path)
                 self.court_warp_matrix = data['court_warp_matrix']
                 self.game_warp_matrix = data['game_warp_matrix']
                 
-                # Re-run detection on the first frame to get the line coordinates for drawing
                 ret, frame = cap.read()
                 if ret:
-                    # Manually warp the reference points to get frame coordinates
                     court_ref = self.court_detector.court_reference
                     p = np.array(court_ref.get_important_lines(), dtype=np.float32).reshape((-1, 1, 2))
                     self.court_lines_frame_coords = cv2.perspectiveTransform(p, self.court_warp_matrix).reshape(-1)
+                    
+                    if self.enable_player_tracking and self.player_tracker:
+                        self.player_tracker.update(frame) 
                 
-                logger.info(f"Loaded court homography from {self.court_homography_path}. Skipping calibration.")
-                cap.set(cv2.CAP_PROP_POS_FRAMES, 0) # Reset video
-                return
+                logger.info(f"Loaded court homography from {self.court_homography_path}. Skipping court calibration.")
+                court_calibrated = True
             except Exception as e:
                 logger.warning(f"Failed to load homography from {self.court_homography_path}: {e}. Recalibrating.")
 
         
-        successful_detections = 0
-        for frame_i in range(1, self.calib_frames + 1):
+        if not court_calibrated:
+            successful_detections = 0
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+
+            for frame_i in range(1, calib_frames + 1):
+                ret, frame = cap.read()
+                if not ret:
+                    break
+
+                if frame_i == 1:
+                    lines = self.court_detector.detect(frame)
+                else:
+                    lines = self.court_detector.track_court(frame)
+
+                if self.court_detector.success_flag and lines is not None:
+                    successful_detections += 1
+                    self.court_lines_frame_coords = lines
+                    self.court_warp_matrix = self.court_detector.court_warp_matrix[-1]
+                    self.game_warp_matrix = self.court_detector.game_warp_matrix[-1]
+
+                if self.enable_player_tracking and self.player_tracker:
+                    self.player_tracker.update(frame)
+
+
+                logger.info(f'Calibration Frame: {frame_i}/{calib_frames} (Court Successes: {successful_detections})', end='\r')
+            
+            # Finalize court calibration result and save homography
+            if self.court_warp_matrix is not None:
+                logger.info("\nCourt calibration finalized. Saving homography.")
+                try:
+                    np.savez(self.court_homography_path, 
+                            court_warp_matrix=self.court_warp_matrix, 
+                            game_warp_matrix=self.game_warp_matrix,
+                            best_conf=self.court_detector.best_conf)
+                    logger.info(f"Final homography matrices saved to: {self.court_homography_path}")
+                except Exception as e:
+                    logger.error(f"Failed to save homography matrices: {e}")
+            else:
+                logger.error("\nCourt calibration failed on all frames.")
+                self.enable_court_tracking = False
+                self.enable_event_detection = False
+        
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        self.frame_count = 0 
+
+        if self.enable_player_tracking and self.player_tracker and not self.player_tracker.calibration_done:
+             self._run_player_calibration(cap, calib_frames)
+
+
+    def _run_player_calibration(self, cap: cv2.VideoCapture, calib_frames: int):
+        """Helper to run player calibration specifically."""
+        logger.info(f'Starting dedicated player calibration on the first {calib_frames} frames...')
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        for frame_i in range(1, calib_frames + 1):
             ret, frame = cap.read()
             if not ret:
                 break
-                
-            # Full detection on the first frame, then track/refine
-            if frame_i == 1:
-                lines = self.court_detector.detect(frame)
-            else:
-                lines = self.court_detector.track_court(frame)
+            self.player_tracker.update(frame)
+            logger.info(f'Player Calibration Frame: {frame_i}/{calib_frames}', end='\r')
+        logger.info("\nPlayer calibration finalized.")
 
-            if self.court_detector.success_flag and lines is not None:
-                successful_detections += 1
-                self.court_lines_frame_coords = lines
-                self.court_warp_matrix = self.court_detector.court_warp_matrix[-1]
-                self.game_warp_matrix = self.court_detector.game_warp_matrix[-1]
 
-            logger.info(f'Calibration Frame: {frame_i}/{self.calib_frames} (Successes: {successful_detections})', end='\r')
-        
-        # Reset video to start
-        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-        self.frame_count = 0 
-        
-        if self.court_warp_matrix is not None:
-            logger.info("\nCourt calibration finalized. Saving homography.")
-            # Save the final homography matrices
-            try:
-                np.savez(self.court_homography_path, 
-                         court_warp_matrix=self.court_warp_matrix, 
-                         game_warp_matrix=self.game_warp_matrix,
-                         best_conf=self.court_detector.best_conf)
-                logger.info(f"Final homography matrices saved to: {self.court_homography_path}")
-            except Exception as e:
-                logger.error(f"Failed to save homography matrices: {e}")
-        else:
-            logger.error("\nCourt calibration failed on all frames.")
-            self.enable_court_tracking = False
-            self.enable_event_detection = False
-            
     def analyze_video(self, video_path: str) -> None:
         """
         Analyze tennis video with comprehensive tracking
@@ -222,9 +253,7 @@ class TennisAnalyzer:
             f"Video: {frame_width}x{frame_height}, {self.fps} FPS, {total_frames} frames"
         )
         
-        # --- Court Calibration (New Integration) ---
         self._calibrate_court(cap, total_frames)
-        # -------------------------------------------
 
         out_writer = None
         if self.save_output and self.output_path:
@@ -236,7 +265,6 @@ class TennisAnalyzer:
         start_time = time.time()
 
         try:
-            # The capture is now reset to frame 0 after calibration
             while True:
                 ret, frame = cap.read()
                 if not ret:
@@ -244,10 +272,8 @@ class TennisAnalyzer:
 
                 self.frame_count += 1
                 
-                # Perform analysis
                 result_frame = self._analyze_frame(frame)
 
-                # Display results
                 if self.show_display:
                     cv2.imshow("TennIQ Analysis", result_frame)
                     key = cv2.waitKey(1) & 0xFF
@@ -290,6 +316,7 @@ class TennisAnalyzer:
 
             self._print_analysis_summary()
 
+
     def _analyze_frame(self, frame: np.ndarray) -> np.ndarray:
         """
         Analyze single frame with all tracking components
@@ -302,14 +329,15 @@ class TennisAnalyzer:
         """
         result_frame = frame.copy()
 
-        # 1. Player Tracking (If Court is ready)
-        if self.enable_player_tracking and self.player_tracker and self.court_warp_matrix is not None:
-            # TODO: Add player tracking call here
+        # 1. Player Tracking 
+        if self.enable_player_tracking and self.player_tracker:
+            # NOTE: PlayerTracker handles its own calibration state internally
+            # It needs to know the court matrix primarily for calculating court-view positions,
+            # but the raw update can happen without it. Passing it if available.
             self.player_tracker.update(frame, self.court_warp_matrix)
 
         # 2. Ball Tracking
         if self.enable_ball_tracking and self.ball_tracker:
-            # NOTE: Ball tracker's update logic depends on its internal model/queue
             self.ball_tracker.update(frame) 
 
         # 3. Event Detection
@@ -341,14 +369,12 @@ class TennisAnalyzer:
                 
         # 3. Mark players
         if self.enable_player_tracking and self.player_tracker:
-            # TODO: Add player drawing call here
             result_frame = self.player_tracker.draw_players(result_frame)
 
 
         return result_frame
-
+    
     def _draw_info_overlay(self, frame: np.ndarray) -> np.ndarray:
-        # ... (implementation of _draw_info_overlay remains the same as original)
         result_frame = frame.copy()
 
         # Info panel background
@@ -367,10 +393,6 @@ class TennisAnalyzer:
             (255, 255, 255),
             1,
         )
-
-        """
-        Mark whether each tracking is ON or OFF
-        """
 
         y_offset += 25
         status_color = (0, 255, 0) if self.enable_ball_tracking else (128, 128, 128)
@@ -422,7 +444,6 @@ class TennisAnalyzer:
         return result_frame
     
     def _print_analysis_summary(self):
-        # ... (implementation of _print_analysis_summary remains the same as original)
         print("\n" + "=" * 50)
         print("TENNIS ANALYSIS SUMMARY")
         print("=" * 50)
@@ -436,7 +457,7 @@ class TennisAnalyzer:
             print("Court tracking done and calibrated.")
 
         if self.enable_player_tracking and self.player_tracker:
-            print(f"Player tracking done")
+            print(f"Player tracking done (Calibration: {'Completed' if self.player_tracker.calibration_done else 'Running'})")
 
         if self.enable_ball_tracking and self.ball_tracker:
             print(f"Ball tracking done")
@@ -445,23 +466,13 @@ class TennisAnalyzer:
             print(f"Event detection done")
 
         print("=" * 50)
-        
-    def analyze_image_sequence(self, image_dir: str) -> None:
-        """
-        Analyze sequence of images (e.g., extracted frames)
-        NOTE: Court calibration must be done externally/via config loading for this mode.
 
-        Args:
-            image_dir: Directory containing image sequence
-        """
+
+    def analyze_image_sequence(self, image_dir: str) -> None:
         if not os.path.exists(image_dir):
             logger.error(f"Image directory not found: {image_dir}")
             return
             
-        # NOTE: In image sequence mode, we assume the homography is loaded via config/file
-        # or the user expects the court to be detected only once on the first frame
-        # which is handled by the first call to analyze_frame in the loop if self.court_warp_matrix is None.
-        
         # Get image files
         image_files = []
         for ext in ["*.jpg", "*.jpeg", "*.png"]:
@@ -475,7 +486,9 @@ class TennisAnalyzer:
 
         logger.info(f"Found {len(image_files)} images in {image_dir}")
 
-        # Process images sequentially
+        if self.enable_player_tracking and self.player_tracker:
+             self.player_tracker.calibration_max_frames = min(self.calib_frames, len(image_files))
+
         for i, image_path in enumerate(image_files):
             frame = cv2.imread(image_path)
             if frame is None:
@@ -483,12 +496,12 @@ class TennisAnalyzer:
 
             self.frame_count = i + 1
             
-            # Perform initial court detection on the first frame if not already loaded
             if self.enable_court_tracking and self.court_warp_matrix is None:
                 self.court_detector.detect(frame)
                 self.court_lines_frame_coords = self.court_detector.lines
-                self.court_warp_matrix = self.court_detector.court_warp_matrix[-1]
-                self.game_warp_matrix = self.court_detector.game_warp_matrix[-1]
+
+                self.court_warp_matrix = self.court_detector.court_warp_matrix[-1] if self.court_detector.court_warp_matrix else None
+                self.game_warp_matrix = self.court_detector.game_warp_matrix[-1] if self.court_detector.game_warp_matrix else None
 
             result_frame = self._analyze_frame(frame)
 
@@ -527,7 +540,7 @@ def main():
         default="video",
         help="Analysis mode: video file or image sequence",
     )
-    # Add an optional argument for calibration frames, which can also be in the config
+
     parser.add_argument(
         "--calib-frames",
         type=int,
@@ -535,18 +548,38 @@ def main():
         help="Override the number of calibration frames specified in the config",
     )
 
+    parser.add_argument(
+        "--exp-pred",
+        type=float,
+        default=None,
+        help="Override the exponential prediction weight for player tracking (default is 1.0)",
+    )
+
+    parser.add_argument(
+        "--player-model",
+        type=str,
+        default=None,
+        help="Path to a custom fine-tuned YOLO model (.pt) for player tracking.",
+    )
     args = parser.parse_args()
 
     # Initialize
     analyzer = TennisAnalyzer(args.config)
     analyzer.show_display = not args.no_display
 
-    # Apply command line overrides
     if args.output:
         analyzer.save_output = True
         analyzer.output_path = args.output
     if args.calib_frames is not None:
         analyzer.calib_frames = args.calib_frames
+    
+    if args.exp_pred is not None and analyzer.player_tracker:
+        analyzer.player_tracker.exponential_prediction = args.exp_pred
+        logger.info(f"Overriding PlayerTracker exponential_prediction to {args.exp_pred}")
+
+    if args.player_model is not None and analyzer.player_tracker:
+        analyzer.player_model_path = args.player_model
+        analyzer.player_tracker = PlayerTracker(model_path=args.player_model, max_distance=analyzer.player_max_distance, max_lost_frames=analyzer.player_max_lost_frames, exponential_prediction=analyzer.player_exp_pred)
 
     # Run
     try:
