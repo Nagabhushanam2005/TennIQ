@@ -17,7 +17,7 @@ from inference.src.player_tracker import PlayerTracker
 from inference.src.ball_tracker import BallTracker
 from inference.src.tennis_event_detection import TennisEventDetector
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 
@@ -65,7 +65,14 @@ class TennisAnalyzer:
 
         if self.enable_ball_tracking:
             self.ball_tracker = BallTracker()
-            self.ball_tracker.update_config(self.config)
+            ball_model_weights = self.config.get("BALL_MODEL_WEIGHTS")
+            ball_model_name = self.config.get("BALL_MODEL_NAME", "TrackNetV4_TypeA")
+            if ball_model_weights:
+                ball_config = {
+                    "BALL_MODEL_WEIGHTS": ball_model_weights,
+                    "BALL_MODEL_NAME": ball_model_name
+                }
+                self.ball_tracker.update_config(ball_config)
         else:
             self.ball_tracker = None
 
@@ -89,6 +96,8 @@ class TennisAnalyzer:
         self.show_display = self.config.get("SHOW_DISPLAY", True)
         self.save_output = self.config.get("SAVE_OUTPUT", False)
         self.output_path = self.config.get("OUTPUT_PATH", "/dev/null")
+
+        self.frames = []
 
     def _load_config(self, config_path: str) -> Dict:
         """Load TennIQ configuration for inference from file"""
@@ -286,14 +295,13 @@ class TennisAnalyzer:
                 if out_writer:
                     out_writer.write(result_frame)
 
-                if self.frame_count % 100 == 0:
-                    progress = (self.frame_count / total_frames) * 100
-                    elapsed = time.time() - start_time
-                    fps_avg = self.frame_count / elapsed
-                    logger.info(
-                        f"Progress: {progress:.1f}% ({self.frame_count}/{total_frames}), "
-                        f"Avg FPS: {fps_avg:.1f}"
-                    )
+                progress = (self.frame_count / total_frames) * 100
+                elapsed = time.time() - start_time
+                fps_avg = self.frame_count / elapsed
+                logger.info(
+                    f"Progress: {progress:.1f}% ({self.frame_count}/{total_frames}), "
+                    f"Avg FPS: {fps_avg:.1f}"
+                )
 
                 self.prev_frame = frame.copy()
 
@@ -331,14 +339,16 @@ class TennisAnalyzer:
 
         # 1. Player Tracking 
         if self.enable_player_tracking and self.player_tracker:
-            # NOTE: PlayerTracker handles its own calibration state internally
-            # It needs to know the court matrix primarily for calculating court-view positions,
-            # but the raw update can happen without it. Passing it if available.
             self.player_tracker.update(frame, self.court_warp_matrix)
 
         # 2. Ball Tracking
         if self.enable_ball_tracking and self.ball_tracker:
-            self.ball_tracker.update(frame) 
+            if len(self.frames) < 3:
+                self.frames.append(frame)
+            if len(self.frames) == 3:
+                self.ball_tracker.update(self.frames)
+                self.frames = [self.frames[2]]
+                
 
         # 3. Event Detection
         if self.enable_event_detection and self.event_detector:
@@ -489,6 +499,10 @@ class TennisAnalyzer:
         if self.enable_player_tracking and self.player_tracker:
              self.player_tracker.calibration_max_frames = min(self.calib_frames, len(image_files))
 
+
+
+        start_time = time.time()
+
         for i, image_path in enumerate(image_files):
             frame = cv2.imread(image_path)
             if frame is None:
@@ -504,6 +518,11 @@ class TennisAnalyzer:
                 self.game_warp_matrix = self.court_detector.game_warp_matrix[-1] if self.court_detector.game_warp_matrix else None
 
             result_frame = self._analyze_frame(frame)
+
+            progress = (self.frame_count / len(image_files)) * 100
+            elapsed = time.time() - start_time
+            fps_avg = self.frame_count / elapsed
+            print(f"Progress: {progress:.1f}% ({self.frame_count}/{len(image_files)}), Avg FPS: {fps_avg:.1f}", end='\r')
 
             if self.show_display:
                 cv2.imshow("TennIQ Analysis", result_frame)
@@ -561,6 +580,23 @@ def main():
         default=None,
         help="Path to a custom fine-tuned YOLO model (.pt) for player tracking.",
     )
+
+
+
+    parser.add_argument(
+        "--weights",
+        type=str,
+        default=None,
+        help="Path to the trained ball tracking model weights (.pth).",
+    )
+
+    parser.add_argument(
+        "--model-name",
+        type=str,
+        default="TrackNetV5_TypeA",
+        choices=['Baseline_TrackNetV2', 'TrackNetV4_TypeA', 'TrackNetV4_TypeB', 'TrackNetV5'],
+        help="Name of the ball tracking model to use.",
+    )
     args = parser.parse_args()
 
     # Initialize
@@ -580,6 +616,14 @@ def main():
     if args.player_model is not None and analyzer.player_tracker:
         analyzer.player_model_path = args.player_model
         analyzer.player_tracker = PlayerTracker(model_path=args.player_model, max_distance=analyzer.player_max_distance, max_lost_frames=analyzer.player_max_lost_frames, exponential_prediction=analyzer.player_exp_pred)
+
+
+    if args.weights and analyzer.ball_tracker:
+        ball_config = {
+            "BALL_MODEL_WEIGHTS": args.weights,
+            "BALL_MODEL_NAME": args.model_name
+        }
+        analyzer.ball_tracker.update_config(ball_config)
 
     # Run
     try:

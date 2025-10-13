@@ -145,7 +145,6 @@ class PlayerTracker:
         
         # 1. Detection
         results = self.model.predict(frame, verbose=False, classes=[0], save=False) 
-        
         person_detections = []
         if results and results[0].boxes.data.shape[0] > 0:
             boxes_data = results[0].boxes.data.cpu().numpy()

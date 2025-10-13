@@ -195,7 +195,8 @@ elif [[ "$ACTION" == "infer" ]]; then
     eval $INFER_CMD
 elif [[ "$ACTION" == "demo" ]]; then
     echo "Running demo analysis..."
-    FRAMES_DIR="data/web-scrapping/frames_test"
+    # FRAMES_DIR="data/web-scrapping/frames_test"
+    FRAMES_DIR="TrackNetv4/data/tennis/Dataset/game4/Clip1"
     if [[ ! -d "$FRAMES_DIR" ]]; then
         echo "Error: Frames directory not found: $FRAMES_DIR"
         echo "Please run: $0 --import -c <config_file> first"
@@ -205,5 +206,5 @@ elif [[ "$ACTION" == "demo" ]]; then
     if [[ -z "$CONFIG_FILE" ]]; then
         CONFIG_FILE="inference/config/config_test.txt"
     fi
-    $PYTHON_EXEC -m inference.inference_main --config "$CONFIG_FILE" --input "$FRAMES_DIR" --mode images --player-model "yolo_train/player_detection/yolo11n_player_finetune4/weights/best.pt"
+    $PYTHON_EXEC -m inference.inference_main --config "$CONFIG_FILE" --input "$FRAMES_DIR" --mode images --model-name TrackNetV4_TypeA --weights models/TrackNetV4_TypeA_epoch_41.pth --player-model "yolo_train/player_detection/yolo11n_player_finetune4/weights/best.pt"
 fi
