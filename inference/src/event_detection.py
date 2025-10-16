@@ -20,7 +20,7 @@ class EventDetector:
         self.frame_count = 0
 
         self.model = None
-        self.threshold = 0.45
+        self.threshold = 0.4
         self.last_known_bounce_frames: Set[int] = set()
 
         self.load_bounce_model(bounce_model_path)
@@ -164,7 +164,7 @@ class EventDetector:
                     
                     if not is_none[num + 1]:
                         dist_val = distance.euclidean((x_ext, y_ext), (x_ball[num + 1], y_ball[num + 1]))
-                        if dist_val > 80:
+                        if dist_val > 60:
                             x_ball[num + 1], y_ball[num + 1] = None, None
                             is_none[num + 1] = True
                     counter += 1
