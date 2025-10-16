@@ -2,10 +2,7 @@ import logging
 import cv2
 import numpy as np
 import torch
-from PIL import Image
 from collections import deque
-import queue
-import time
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -24,7 +21,7 @@ class BallTracker:
     def update_config(self, config):
         model_weights = config.get("BALL_MODEL_WEIGHTS")
         model_name = config.get("BALL_MODEL_NAME", "TrackNetV4_TypeA")
-        
+
         if model_weights and not self.model_loaded:
             self._load_model(model_weights, model_name)
 
@@ -33,7 +30,7 @@ class BallTracker:
             from TrackNetv4.src.util import get_model
             INPUT_HEIGHT = 288
             INPUT_WIDTH = 512
-            
+
             self.model = get_model(model_name, INPUT_HEIGHT, INPUT_WIDTH)
             self.model.load_state_dict(torch.load(model_weights, map_location=self.device))
             self.model.to(self.device)
@@ -43,12 +40,6 @@ class BallTracker:
             logger.info(f"Ball tracking model loaded: {model_name}")
         except Exception as e:
             logger.error(f"Failed to load ball tracking model: {e}")
-
-    def detect_ball(self):
-        pass
-
-    def detect_ball_motion(self):
-        pass
 
     def update(self, frames):
         if not self.model_loaded:
@@ -69,7 +60,7 @@ class BallTracker:
                 ball_preds = self.model.forward_ball_only(input_tensor)
             else:
                 ball_preds = self.model(input_tensor)
-            
+
             if isinstance(ball_preds, tuple):
                 ball_preds = ball_preds[0]
         ball_predictions = ball_preds.cpu()
@@ -97,15 +88,12 @@ class BallTracker:
             return
 
         largest_bounding_box = max([cv2.boundingRect(c) for c in contours], key=lambda r: r[2] * r[3])
-        
+
         predicted_x_center = int(self.width_ratio * (largest_bounding_box[0] + largest_bounding_box[2] / 2))
         predicted_y_center = int(self.height_ratio * (largest_bounding_box[1] + largest_bounding_box[3] / 2))
 
         self.predicted_points_queue.appendleft((predicted_x_center, predicted_y_center))
         self.ball_positions.append((predicted_x_center, predicted_y_center))
-
-    def detect_bounce(self):
-        pass
 
     def draw_ball(self, frame):
         result_frame = frame.copy()
@@ -117,3 +105,8 @@ class BallTracker:
             cv2.circle(result_frame, current_pos, 8, (0, 0, 255), -1)
 
         return result_frame
+
+    def get_ball_history(self):
+        """Returns the list of all tracked ball positions."""
+        return self.ball_positions
+

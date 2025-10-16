@@ -225,33 +225,56 @@ class CourtDetector:
 
                 new_vertical_lines.append(line)
         return new_horizontal_lines, new_vertical_lines
-
   def _find_homography(self, horizontal_lines, vertical_lines):
         """
-        Finds transformation from reference court to frame`s court using 4 pairs of matching points
+        Finds transformation from reference court to frame`s court using 4 pairs of matching points.
+
+        Optimization notes:
+        1. Pre-format line endpoints for line_intersection function to improve readability and 
+           potentially minor efficiency gains by avoiding repeated tuple/slicing in the innermost loops.
+        2. Pre-convert reference configurations to np.float32 outside the innermost loop.
         """
         max_score = -np.inf
         max_mat = None
         max_inv_mat = None
         k = 0
+
+        # Pre-format lines for intersection calculation: ((x1, y1), (x2, y2))
+        h_lines_formatted = [((h[0], h[1]), (h[2], h[3])) for h in horizontal_lines]
+        v_lines_formatted = [((v[0], v[1]), (v[2], v[3])) for v in vertical_lines]
+        
+        # Pre-convert court configurations for cv2.findHomography
+        court_configs_float32 = {i: np.float32(config) for i, config in self.court_reference.court_conf.items()}
+
         # Loop over every pair of horizontal lines and every pair of vertical lines
-        for horizontal_pair in list(combinations(horizontal_lines, 2)):
-            for vertical_pair in list(combinations(vertical_lines, 2)):
-                h1, h2 = horizontal_pair
-                v1, v2 = vertical_pair
+        h_line_pairs = list(combinations(h_lines_formatted, 2))
+        v_line_pairs = list(combinations(v_lines_formatted, 2))
+
+        for h_pair in h_line_pairs:
+            h1_formatted, h2_formatted = h_pair
+            for v_pair in v_line_pairs:
+                v1_formatted, v2_formatted = v_pair
+
                 # Finding intersection points of all lines
-                i1 = line_intersection((tuple(h1[:2]), tuple(h1[2:])), (tuple(v1[0:2]), tuple(v1[2:])))
-                i2 = line_intersection((tuple(h1[:2]), tuple(h1[2:])), (tuple(v2[0:2]), tuple(v2[2:])))
-                i3 = line_intersection((tuple(h2[:2]), tuple(h2[2:])), (tuple(v1[0:2]), tuple(v1[2:])))
-                i4 = line_intersection((tuple(h2[:2]), tuple(h2[2:])), (tuple(v2[0:2]), tuple(v2[2:])))
+                # The line_intersection function must handle the formatted line tuples.
+                i1 = line_intersection(h1_formatted, v1_formatted)
+                i2 = line_intersection(h1_formatted, v2_formatted)
+                i3 = line_intersection(h2_formatted, v1_formatted)
+                i4 = line_intersection(h2_formatted, v2_formatted)
 
                 intersections = [i1, i2, i3, i4]
-                intersections = sort_intersection_points(intersections)
+                # Sort intersection points from top left to bottom right
+                intersections_sorted = sort_intersection_points(intersections)
+                intersections_float32 = np.float32(intersections_sorted)
 
-                for i, configuration in self.court_reference.court_conf.items():
+                for i, configuration_float32 in court_configs_float32.items():
                     # Find transformation
-                    matrix, _ = cv2.findHomography(np.float32(configuration), np.float32(intersections), method=0)
+                    matrix, _ = cv2.findHomography(configuration_float32, intersections_float32, method=0)
+                    
+                    # NOTE: cv2.invert can fail, but here it's assumed to succeed for a valid matrix.
+                    # In a robust implementation, a check for success of cv2.invert would be necessary.
                     inv_matrix = cv2.invert(matrix)[1]
+                    
                     # Get transformation score
                     confi_score = self._get_confi_score(matrix)
 
@@ -264,13 +287,12 @@ class CourtDetector:
                     k += 1
 
         if self.verbose:
+            # Display result if verbose mode is on
             frame = self.frame.copy()
             court = self.add_court_overlay(frame, max_mat, (255, 0, 0))
             cv2.imshow('court', court)
             if cv2.waitKey(0) & 0xff == 27:
                 cv2.destroyAllWindows()
-        # print(f'Score = {max_score}')
-        # print(f'Combinations tested = {k}')
 
         return max_mat, max_inv_mat, max_score
 

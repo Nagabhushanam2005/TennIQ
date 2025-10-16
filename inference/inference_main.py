@@ -15,7 +15,7 @@ from inference.src.court_reference import CourtReference
 
 from inference.src.player_tracker import PlayerTracker 
 from inference.src.ball_tracker import BallTracker
-from inference.src.tennis_event_detection import TennisEventDetector
+from inference.src.event_detection import EventDetector
 
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
@@ -41,13 +41,9 @@ class TennisAnalyzer:
         self.player_max_lost_frames = self.config.get("PLAYER_MAX_LOST_FRAMES", 10)
         self.player_exp_pred = self.config.get("PLAYER_EXPONENTIAL_PREDICTION", 1.0)
         self.player_model_path = self.config.get("PLAYER_MODEL_PATH", 'yolo11n.pt')
+        self.bounce_model_path = self.config.get("BOUNCE_MODEL_PATH")
 
-        # Event detection only if all tracking is enabled
-        self.enable_event_detection = (
-            self.enable_ball_tracking
-            and self.enable_player_tracking
-            and self.enable_court_tracking
-        )
+        self.enable_event_detection = True
 
         self.court_warp_matrix: Optional[np.ndarray] = None
         self.game_warp_matrix: Optional[np.ndarray] = None
@@ -82,8 +78,10 @@ class TennisAnalyzer:
             self.court_detector = None
 
         if self.enable_event_detection:
-            # TODO
-            self.event_detector = TennisEventDetector()
+            self.event_detector = EventDetector(
+                self.ball_tracker, 
+                bounce_model_path=self.bounce_model_path
+            )
         else:
             self.event_detector = None
 
@@ -217,23 +215,7 @@ class TennisAnalyzer:
                 self.enable_event_detection = False
         
         cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-        self.frame_count = 0 
-
-        if self.enable_player_tracking and self.player_tracker and not self.player_tracker.calibration_done:
-             self._run_player_calibration(cap, calib_frames)
-
-
-    def _run_player_calibration(self, cap: cv2.VideoCapture, calib_frames: int):
-        """Helper to run player calibration specifically."""
-        logger.info(f'Starting dedicated player calibration on the first {calib_frames} frames...')
-        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-        for frame_i in range(1, calib_frames + 1):
-            ret, frame = cap.read()
-            if not ret:
-                break
-            self.player_tracker.update(frame)
-            logger.info(f'Player Calibration Frame: {frame_i}/{calib_frames}', end='\r')
-        logger.info("\nPlayer calibration finalized.")
+        self.frame_count = 0
 
 
     def analyze_video(self, video_path: str) -> None:
@@ -347,12 +329,11 @@ class TennisAnalyzer:
                 self.frames.append(frame)
             if len(self.frames) == 3:
                 self.ball_tracker.update(self.frames)
-                self.frames = [self.frames[2]]
+                self.frames = [self.frames[1], self.frames[2]]
                 
 
         # 3. Event Detection
         if self.enable_event_detection and self.event_detector:
-            # TODO: Add event detection call here
             self.event_detector.update()
 
         result_frame = self._draw_annotations(result_frame)
@@ -376,11 +357,14 @@ class TennisAnalyzer:
                 x1, y1, x2, y2 = lines[i],lines[i+1], lines[i+2], lines[i+3]
                 # Draw lines in White (255, 255, 255)
                 cv2.line(result_frame, (int(x1),int(y1)),(int(x2),int(y2)), (255, 255, 255), 2)
-                
+
         # 3. Mark players
         if self.enable_player_tracking and self.player_tracker:
             result_frame = self.player_tracker.draw_players(result_frame)
 
+        # 4. Mark events
+        if self.enable_event_detection and self.event_detector:
+            result_frame = self.event_detector.draw_events(result_frame)
 
         return result_frame
     
@@ -597,6 +581,12 @@ def main():
         choices=['Baseline_TrackNetV2', 'TrackNetV4_TypeA', 'TrackNetV4_TypeB', 'TrackNetV5'],
         help="Name of the ball tracking model to use.",
     )
+    parser.add_argument(
+        "--bounce-model",
+        type=str,
+        default=None,
+        help="Path to the trained CatBoost model (.cbm) for bounce detection.",
+    )
     args = parser.parse_args()
 
     # Initialize
@@ -625,15 +615,15 @@ def main():
         }
         analyzer.ball_tracker.update_config(ball_config)
 
+    if args.bounce_model is not None and analyzer.event_detector:
+        analyzer.event_detector.load_bounce_model(args.bounce_model)
+        analyzer.bounce_model_path = args.bounce_model
+
     # Run
-    try:
-        if args.mode == "video":
-            analyzer.analyze_video(args.input)
-        else:
-            analyzer.analyze_image_sequence(args.input)
-    except Exception as e:
-        logger.error(f"Analysis failed: {e}")
-        sys.exit(1)
+    if args.mode == "video":
+        analyzer.analyze_video(args.input)
+    else:
+        analyzer.analyze_image_sequence(args.input)
 
 
 if __name__ == "__main__":
