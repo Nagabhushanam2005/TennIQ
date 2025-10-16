@@ -2,6 +2,7 @@ import logging
 import cv2
 import numpy as np
 import torch
+from ultralytics import YOLO
 from collections import deque
 
 logging.basicConfig(level=logging.INFO)
@@ -10,103 +11,96 @@ logger = logging.getLogger(__name__)
 class BallTracker:
     def __init__(self):
         self.model = None
-        self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        self.device = "cuda:0" if torch.cuda.is_available() else "cpu"
         self.predicted_points_queue = deque([None] * 10, maxlen=10)
-        self.width_ratio = 1.0
-        self.height_ratio = 1.0
         self.frame_count = 0
         self.ball_positions = []
         self.model_loaded = False
+        self.target_class_name = "ball"
+        self.conf_threshold = 0.25
 
     def update_config(self, config):
         model_weights = config.get("BALL_MODEL_WEIGHTS")
-        model_name = config.get("BALL_MODEL_NAME", "TrackNetV4_TypeA")
-
         if model_weights and not self.model_loaded:
-            self._load_model(model_weights, model_name)
+            self._load_model(model_weights)
 
-    def _load_model(self, model_weights, model_name):
+    def _load_model(self, model_weights):
         try:
-            from TrackNetv4.src.util import get_model
-            INPUT_HEIGHT = 288
-            INPUT_WIDTH = 512
-
-            self.model = get_model(model_name, INPUT_HEIGHT, INPUT_WIDTH)
-            self.model.load_state_dict(torch.load(model_weights, map_location=self.device))
-            self.model.to(self.device)
-            self.model.eval()
+            self.model = YOLO(model_weights)
             self.model_loaded = True
-            self.model = torch.jit.script(self.model)
-            logger.info(f"Ball tracking model loaded: {model_name}")
+            logger.info(f"YOLOv12 model loaded successfully from {model_weights}")
         except Exception as e:
-            logger.error(f"Failed to load ball tracking model: {e}")
+            logger.error(f"Failed to load YOLOv12 model: {e}")
 
     def update(self, frames):
+        """
+        Perform YOLO-based ball tracking on a batch of 3 frames.
+        frames: [prev_frame, curr_frame, next_frame]
+        """
         if not self.model_loaded:
+            logger.warning("YOLO model not loaded — skipping frame.")
             return
-        if self.width_ratio == 1.0:
-            self._calculate_ratios(frames[2])
 
-        h, w = 288, 512
-        batch = []
-        for f in frames:
-            f = cv2.resize(f, (w, h))
-            f = f[:, :, ::-1].astype(np.float32) / 255.0
-            batch.append(torch.from_numpy(f).permute(2, 0, 1))
+        # if len(frames) < 3:
+        #     logger.warning("Need exactly 3 frames for YOLO-based tracking.")
+        #     return
 
-        input_tensor = torch.cat(batch, dim=0).unsqueeze(0).to(self.device, non_blocking=True)
-        with torch.no_grad():
-            if hasattr(self.model, 'forward_ball_only'):
-                ball_preds = self.model.forward_ball_only(input_tensor)
-            else:
-                ball_preds = self.model(input_tensor)
+        self.frame_count += 1
 
-            if isinstance(ball_preds, tuple):
-                ball_preds = ball_preds[0]
-        ball_predictions = ball_preds.cpu()
-        self._process_predictions(ball_predictions, frames[2])
+        # img_prev = frames[0].astype(np.float32)
+        # img_curr = frames[1].astype(np.float32)
+        # img_next = frames[2].astype(np.float32)
 
-    def _calculate_ratios(self, frame):
-        frame_height, frame_width = frame.shape[:2]
-        INPUT_WIDTH = 512
-        INPUT_HEIGHT = 288
-        self.width_ratio = frame_width / INPUT_WIDTH
-        self.height_ratio = frame_height / INPUT_HEIGHT
+        # stacked_image = (img_prev + img_curr + img_next) / 3.0
+        # composite_frame = stacked_image.astype(np.uint8)
 
+        composite_frame = frames[2]
 
-    def _process_predictions(self, ball_predictions, current_frame):
-        ball_heatmaps = (ball_predictions > 0.5).float()
-        ball_binary_heatmaps = (ball_heatmaps[0] * 255).byte().numpy()
+        results = self.model.predict(
+            source=composite_frame,
+            device=self.device,
+            conf=self.conf_threshold,
+            verbose=False
+        )
 
-        if np.amax(ball_binary_heatmaps[2]) <= 0:
+        if not results or results[0].boxes is None or len(results[0].boxes) == 0:
             self.ball_positions.append(None)
+            self.predicted_points_queue.appendleft(None)
             return
 
-        contours, _ = cv2.findContours(ball_binary_heatmaps[2].copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours:
+        boxes = results[0].boxes
+        xywh = boxes.xywh.cpu().numpy()
+        confs = boxes.conf.cpu().numpy()
+        classes = boxes.cls.cpu().numpy()
+
+        best_box, best_conf = None, 0.0
+        for i in range(len(xywh)):
+            cls_idx = int(classes[i])
+            cls_name = results[0].names.get(cls_idx, "")
+            if cls_name == self.target_class_name and confs[i] > best_conf:
+                best_box, best_conf = xywh[i], confs[i]
+
+        if best_box is None:
             self.ball_positions.append(None)
+            self.predicted_points_queue.appendleft(None)
             return
 
-        largest_bounding_box = max([cv2.boundingRect(c) for c in contours], key=lambda r: r[2] * r[3])
+        x_center, y_center, w, h = best_box
+        ball_point = (int(x_center), int(y_center))
 
-        predicted_x_center = int(self.width_ratio * (largest_bounding_box[0] + largest_bounding_box[2] / 2))
-        predicted_y_center = int(self.height_ratio * (largest_bounding_box[1] + largest_bounding_box[3] / 2))
-
-        self.predicted_points_queue.appendleft((predicted_x_center, predicted_y_center))
-        self.ball_positions.append((predicted_x_center, predicted_y_center))
+        self.predicted_points_queue.appendleft(ball_point)
+        self.ball_positions.append(ball_point)
 
     def draw_ball(self, frame):
+        """Draw the trail and current position of the ball."""
         result_frame = frame.copy()
         for point in self.predicted_points_queue:
             if point is not None:
-                cv2.circle(result_frame, point, 5, (0, 255, 0), 2)
-        current_pos = self.ball_positions[-1] if self.ball_positions else None
-        if current_pos is not None:
-            cv2.circle(result_frame, current_pos, 8, (0, 0, 255), -1)
-
+                cv2.circle(result_frame, point, 4, (0, 255, 0), 2)
+        if self.ball_positions and self.ball_positions[-1] is not None:
+            cv2.circle(result_frame, self.ball_positions[-1], 6, (0, 0, 255), -1)
         return result_frame
 
     def get_ball_history(self):
-        """Returns the list of all tracked ball positions."""
+        """Return all tracked ball positions."""
         return self.ball_positions
-

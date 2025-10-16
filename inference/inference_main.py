@@ -333,7 +333,7 @@ class TennisAnalyzer:
                 
 
         # 3. Event Detection
-        if self.enable_event_detection and self.event_detector:
+        if self.enable_event_detection and self.event_detector and self.ball_tracker:
             self.event_detector.update()
 
         result_frame = self._draw_annotations(result_frame)
