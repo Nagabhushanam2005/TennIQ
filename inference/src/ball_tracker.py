@@ -2,6 +2,7 @@ import logging
 import cv2
 import numpy as np
 import torch
+import threading
 from collections import deque
 
 logging.basicConfig(level=logging.INFO)
@@ -12,6 +13,7 @@ class BallTracker:
         self.model = None
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         self.predicted_points_queue = deque([None] * 10, maxlen=10)
+        self.lock = threading.Lock()
         self.width_ratio = 1.0
         self.height_ratio = 1.0
         self.frame_count = 0
@@ -92,21 +94,25 @@ class BallTracker:
         predicted_x_center = int(self.width_ratio * (largest_bounding_box[0] + largest_bounding_box[2] / 2))
         predicted_y_center = int(self.height_ratio * (largest_bounding_box[1] + largest_bounding_box[3] / 2))
 
+        # with self.lock:
         self.predicted_points_queue.appendleft((predicted_x_center, predicted_y_center))
         self.ball_positions.append((predicted_x_center, predicted_y_center))
 
     def draw_ball(self, frame):
         result_frame = frame.copy()
-        for point in self.predicted_points_queue:
-            if point is not None:
-                cv2.circle(result_frame, point, 5, (0, 255, 0), 2)
-        current_pos = self.ball_positions[-1] if self.ball_positions else None
-        if current_pos is not None:
-            cv2.circle(result_frame, current_pos, 8, (0, 0, 255), -1)
+        with self.lock:
+            points_snapshot = list(self.predicted_points_queue)
+
+            for point in points_snapshot:
+                if point is not None:
+                    cv2.circle(result_frame, point, 5, (0, 255, 0), 2)
+                current_pos = self.ball_positions[-1] if self.ball_positions else None
+                if current_pos is not None:
+                    cv2.circle(result_frame, current_pos, 8, (0, 0, 255), -1)
 
         return result_frame
 
     def get_ball_history(self):
-        """Returns the list of all tracked ball positions."""
         return self.ball_positions
+
 

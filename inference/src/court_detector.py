@@ -13,8 +13,8 @@ class CourtDetector:
   def __init__(self, verbose=0):
     self.verbose = verbose
     self.colour_threshold = 200
-    self.dist_tau = 3
-    self.intensity_threshold = 40
+    self.dist_tau = 1
+    self.intensity_threshold = 60
     self.court_reference = CourtReference()
     self.v_width = 0
     self.v_height = 0
@@ -74,7 +74,7 @@ class CourtDetector:
     Simple thresholding for white pixels
     """
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    gray = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)[1]
+    gray = cv2.threshold(gray, self.colour_threshold, 255, cv2.THRESH_BINARY)[1]
     return gray
 
 
@@ -114,8 +114,9 @@ class CourtDetector:
         """
         minLineLength = 100
         maxLineGap = 20
+        threshold = 80
         # Detect all lines
-        lines = cv2.HoughLinesP(gray, 1, np.pi / 180, 80, minLineLength=minLineLength, maxLineGap=maxLineGap)
+        lines = cv2.HoughLinesP(gray, 1, np.pi / 180, threshold, minLineLength=minLineLength, maxLineGap=maxLineGap)
         lines = np.squeeze(lines)
         if self.verbose:
             display_lines_on_frame(self.frame.copy(), [], lines)
@@ -501,27 +502,27 @@ def sort_intersection_points(intersections):
     p34 = sorted(p34, key=lambda x: x[0])
     return p12 + p34
 
-# def display_lines_on_frame(frame, horizontal=(), vertical=()):
-#     """
-#     Display lines on frame for horizontal and vertical lines
-#     """
+def display_lines_on_frame(frame, horizontal=(), vertical=()):
+    """
+    Display lines on frame for horizontal and vertical lines
+    """
 
-#     '''cv2.line(frame, (int(len(frame[0]) * 4 / 7), 0), (int(len(frame[0]) * 4 / 7), 719), (255, 255, 0), 2)
-#     cv2.line(frame, (int(len(frame[0]) * 3 / 7), 0), (int(len(frame[0]) * 3 / 7), 719), (255, 255, 0), 2)'''
-#     for line in horizontal:
-#         x1, y1, x2, y2 = line
-#         cv2.line(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-#         cv2.circle(frame, (x1, y1), 1, (255, 0, 0), 2)
-#         cv2.circle(frame, (x2, y2), 1, (255, 0, 0), 2)
+    '''cv2.line(frame, (int(len(frame[0]) * 4 / 7), 0), (int(len(frame[0]) * 4 / 7), 719), (255, 255, 0), 2)
+    cv2.line(frame, (int(len(frame[0]) * 3 / 7), 0), (int(len(frame[0]) * 3 / 7), 719), (255, 255, 0), 2)'''
+    for line in horizontal:
+        x1, y1, x2, y2 = line
+        cv2.line(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        cv2.circle(frame, (x1, y1), 1, (255, 0, 0), 2)
+        cv2.circle(frame, (x2, y2), 1, (255, 0, 0), 2)
 
-#     for line in vertical:
-#         x1, y1, x2, y2 = line
-#         cv2.line(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-#         cv2.circle(frame, (x1, y1), 1, (255, 0, 0), 2)
-#         cv2.circle(frame, (x2, y2), 1, (255, 0, 0), 2)
+    for line in vertical:
+        x1, y1, x2, y2 = line
+        cv2.line(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        cv2.circle(frame, (x1, y1), 1, (255, 0, 0), 2)
+        cv2.circle(frame, (x2, y2), 1, (255, 0, 0), 2)
 
-#     cv2.imshow('court', frame)
-#     if cv2.waitKey(0) & 0xff == 27:
-#         cv2.destroyAllWindows()
-#     # cv2.imwrite('../report/t.png', frame)
-#     return frame
+    cv2.imshow('court', frame)
+    if cv2.waitKey(0) & 0xff == 27:
+        cv2.destroyAllWindows()
+    # cv2.imwrite('../report/t.png', frame)
+    return frame

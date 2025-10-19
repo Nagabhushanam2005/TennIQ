@@ -134,7 +134,7 @@ class PlayerTracker:
         self.calibration_max_frames = 30 # Default, overridden by inference_main config
         self.max_players = 2
 
-    def update(self, frame: np.ndarray, court_warp_matrix: Optional[np.ndarray] = None) -> List[Player]:
+    def update(self, frame: np.ndarray) -> List[Player]:
         """
         Processes a single frame for player detection and updates player trajectories.
         """
@@ -148,7 +148,6 @@ class PlayerTracker:
         person_detections = []
         if results and results[0].boxes.data.shape[0] > 0:
             boxes_data = results[0].boxes.data.cpu().numpy()
-            
             for *box, conf, cls in boxes_data:
                 if int(cls) == 0:
                     x1, y1, x2, y2 = map(int, box)
@@ -156,14 +155,13 @@ class PlayerTracker:
                     person_detections.append((float(conf), (x1, y1, x2, y2), center))
         
         # 2. Tracking Logic
-        
         if not self.calibration_done:
             self._calibration_update(person_detections)
             return []
         else:
 
             # Recalibration Check
-            if not self.recalibrating and not self.active_players and self.frame_count % 30 == 0:
+            if not self.recalibrating and not self.active_players and self.frame_count % 10 == 0:
                 logger.info("All active players lost. Starting 10-frame re-calibration.")
                 self.recalibrating = True
                 self.recalib_frame_count = 0
@@ -172,10 +170,8 @@ class PlayerTracker:
             if self.recalibrating:
                 self._temporary_recalibration_update(person_detections)
 
-            # Main Tracking Phase
             self._main_tracking_update(frame, person_detections)
             
-            # TODO: Convert to court coordinates using court_warp_matrix if required
             return self.active_players
 
 

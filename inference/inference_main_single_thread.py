@@ -7,10 +7,6 @@ import glob
 from typing import Dict, List, Optional, Tuple
 import logging
 import time
-import threading
-from concurrent.futures import ThreadPoolExecutor
-import queue
-from collections import deque
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
@@ -21,7 +17,7 @@ from inference.src.player_tracker import PlayerTracker
 from inference.src.ball_tracker import BallTracker
 from inference.src.event_detection import EventDetector
 
-logging.basicConfig(level=logging.ERROR)
+logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 
@@ -38,7 +34,7 @@ class TennisAnalyzer:
         self.enable_ball_tracking = self.config.get("ENABLE_BALL_TRACKING", True)
         self.enable_player_tracking = self.config.get("ENABLE_PLAYER_TRACKING", True)
         self.enable_court_tracking = self.config.get("ENABLE_COURT_TRACKING", True)
-        self.calib_frames = self.config.get("CALIB_FRAMES", 10)
+        self.calib_frames = self.config.get("CALIB_FRAMES", 30)
         self.court_homography_path = self.config.get("COURT_HOMOGRAPHY_PATH", "court_homography_matrices.npz")
         
         self.player_max_distance = self.config.get("PLAYER_MAX_DISTANCE", 25)
@@ -100,14 +96,6 @@ class TennisAnalyzer:
         self.output_path = self.config.get("OUTPUT_PATH", "/dev/null")
 
         self.frames = []
-        self.thread_pool = ThreadPoolExecutor(max_workers=5)
-        self.tracking_futures = {}
-        self.result_lock = threading.Lock()
-        
-        self.presentation_fps = 24
-        self.presentation_results = deque()
-        self.last_presentation_time = 0
-        self.frame_interval = 1.0 / self.presentation_fps
 
     def _load_config(self, config_path: str) -> Dict:
         """Load TennIQ configuration for inference from file"""
@@ -141,32 +129,6 @@ class TennisAnalyzer:
         except Exception as e:
             logger.error(f"Error loading config: {e}")
         return config
-
-    def set_presentation_fps(self, fps: int):
-        self.presentation_fps = fps
-        self.frame_interval = 1.0 / fps
-        logger.info(f"Presentation FPS set to {fps}, frame interval: {self.frame_interval:.3f}s")
-
-    def presentation(self):
-        current_time = time.time()
-        
-        if current_time - self.last_presentation_time >= self.frame_interval:
-            if self.presentation_results:
-                result_frame = self.presentation_results[-1]
-                
-                if self.show_display:
-                    cv2.imshow("TennIQ Analysis", result_frame)
-                    key = cv2.waitKey(1) & 0xFF
-                    if key == ord("q"):
-                        return False
-                
-                self.last_presentation_time = current_time
-            
-            max_results = self.presentation_fps * 2
-            while len(self.presentation_results) > max_results:
-                self.presentation_results.popleft()
-        
-        return True
 
     def _calibrate_court(self, cap: cv2.VideoCapture, total_frames: int) -> None:
         """
@@ -265,26 +227,47 @@ class TennisAnalyzer:
         minimap = cv2.resize(court_img, (width_minimap, height_minimap))
         return minimap
 
-    def _update_player_tracking(self, frame: np.ndarray) -> None:
-        """Update player tracking in parallel"""
+    def _analyze_frame(self, frame: np.ndarray) -> np.ndarray:
+        """
+        Analyze single frame with all tracking components
+
+        Args:
+            frame: Input video frame
+
+        Returns:
+            Annotated frame with analysis results
+        """
+        result_frame = frame.copy()
+
+        # 1. Player Tracking 
         if self.enable_player_tracking and self.player_tracker:
-            start_time = time.time()
-            self.player_tracker.update(frame)
-            print(time.time() - start_time)
+            self.player_tracker.update(frame, self.court_warp_matrix)
 
-    def _update_ball_tracking(self, frames: List[np.ndarray]) -> None:
-        """Update ball tracking in parallel"""
-        if self.enable_ball_tracking and self.ball_tracker and len(frames) == 3:
-            self.ball_tracker.update(frames)
+        # 2. Ball Tracking
+        if self.enable_ball_tracking and self.ball_tracker:
+            if len(self.frames) < 3:
+                self.frames.append(frame)
+            if len(self.frames) == 3:
+                self.ball_tracker.update(self.frames)
+                self.frames = [self.frames[1], self.frames[2]]
+                
 
-    def _update_event_detection(self) -> None:
-        """Update event detection in parallel"""
-        if self.enable_event_detection and self.event_detector and self.ball_tracker:
+        # 3. Event Detection
+        if self.enable_event_detection and self.event_detector:
             self.event_detector.update()
+
+        start = time.time()
+        result_frame = self._draw_annotations(result_frame)
+        # result_frame = self._draw_minimap(result_frame)
+        print("time for minimap:", time.time() - start)
+
+        result_frame = self._draw_info_overlay(result_frame)
+
+        return result_frame
 
     def _draw_annotations(self, frame: np.ndarray) -> np.ndarray:
         """Draw all tracking annotations on frame"""
-        result_frame = frame
+        result_frame = frame.copy()
 
         # 1. Mark ball position
         if self.enable_ball_tracking and self.ball_tracker:
@@ -308,61 +291,9 @@ class TennisAnalyzer:
 
         return result_frame
 
-
-
-    def _analyze_frame(self, frame: np.ndarray) -> np.ndarray:
-        """
-        Analyze single frame with all tracking components in parallel
-
-        Args:
-            frame: Input video frame
-
-        Returns:
-            Annotated frame with analysis results
-        """
-        frame_id = self.frame_count
-        
-        # Update frame buffer for ball tracking
-        if self.enable_ball_tracking:
-            if len(self.frames) < 3:
-                self.frames.append(frame)
-            if len(self.frames) == 3:
-                ball_frames = self.frames
-                self.frames = [self.frames[1], self.frames[2]]
-            else:
-                ball_frames = None
-        else:
-            ball_frames = None
-
-        futures = []
-        
-        # Player tracking
-        if self.enable_player_tracking:
-            player_future = self.thread_pool.submit(self._update_player_tracking, frame)
-            futures.append(player_future)
-        
-        # Ball tracking
-        if self.enable_ball_tracking and ball_frames:
-            ball_future = self.thread_pool.submit(self._update_ball_tracking, ball_frames)
-            futures.append(ball_future)
-        
-        # Event detection
-        if self.enable_event_detection:
-            event_future = self.thread_pool.submit(self._update_event_detection)
-            futures.append(event_future)
-        
-        for future in futures:
-            future.result()
-        result_frame = self._draw_annotations(frame)
-        # Add info overlay (fast operation)
-
-        result_frame = self._draw_info_overlay(result_frame)
-
-        return result_frame
-
     def _draw_minimap(self, frame: np.ndarray) -> np.ndarray:
         """Draw court minimap on frame"""
-        result_frame = frame
+        result_frame = frame.copy()
 
         # Draw court minimap with players and ball to the right side
         frame_h, frame_w = result_frame.shape[0], result_frame.shape[1]
@@ -464,10 +395,10 @@ class TennisAnalyzer:
         return combined
     
     def _draw_info_overlay(self, frame: np.ndarray) -> np.ndarray:
-        result_frame = frame
+        result_frame = frame.copy()
 
         # Info panel background
-        overlay = result_frame
+        overlay = result_frame.copy()
         cv2.rectangle(overlay, (10, 10), (400, 180), (0, 0, 0), -1)
         cv2.addWeighted(overlay, 0.7, result_frame, 0.3, 0, result_frame)
 
@@ -556,6 +487,7 @@ class TennisAnalyzer:
 
         print("=" * 50)
 
+
     def analyze_image_sequence(self, image_dir: str) -> None:
         if not os.path.exists(image_dir):
             logger.error(f"Image directory not found: {image_dir}")
@@ -575,68 +507,47 @@ class TennisAnalyzer:
         logger.info(f"Found {len(image_files)} images in {image_dir}")
 
         if self.enable_player_tracking and self.player_tracker:
-            self.player_tracker.calibration_max_frames = min(self.calib_frames, len(image_files))
+             self.player_tracker.calibration_max_frames = min(self.calib_frames, len(image_files))
 
-        
-        # Create a separate thread pool for frame analysis
-        analysis_pool = ThreadPoolExecutor(max_workers=3)
-        frame_queue = queue.Queue()
+
+
         start_time = time.time()
-        submitted_frames = 0
-        processed_frames = 0
-        processed_frames_1 = 0
-        fps_avg = 0.0
-        
-        def process_frame(frame_data):
-            i, image_path, frame = frame_data
-            result_frame = self._analyze_frame(frame)
-            return i, result_frame
 
         for i, image_path in enumerate(image_files):
             frame = cv2.imread(image_path)
             if frame is None:
                 continue
 
-            # Court detection for first frame only
-            if i == 0 and self.enable_court_tracking and self.court_warp_matrix is None:
+            self.frame_count = i + 1
+            
+            if self.enable_court_tracking and self.court_warp_matrix is None:
                 self.court_detector.detect(frame)
                 self.court_lines_frame_coords = self.court_detector.lines
+
                 self.court_warp_matrix = self.court_detector.court_warp_matrix[-1] if self.court_detector.court_warp_matrix else None
                 self.game_warp_matrix = self.court_detector.game_warp_matrix[-1] if self.court_detector.game_warp_matrix else None
 
-            # Submit frame for parallel processing
-            future = analysis_pool.submit(process_frame, (i, image_path, frame))
-            frame_queue.put((i, future))
-            submitted_frames += 1
+            result_frame = self._analyze_frame(frame)
 
-        # Process any remaining frames in queue
-        while not frame_queue.empty():
-            frame_idx, future = frame_queue.get()
-            _, result_frame = future.result()
-            
-            self.presentation_results.append(result_frame)
-            
-            self.frame_count = frame_idx + 1
-            processed_frames += 1
-            
-            progress = (processed_frames / len(image_files)) * 100
+            progress = (self.frame_count / len(image_files)) * 100
+            elapsed = time.time() - start_time
+            fps_avg = self.frame_count / elapsed
+            print(f"Progress: {progress:.1f}% ({self.frame_count}/{len(image_files)}), Avg FPS: {fps_avg:.1f}", end="\r")
 
-            if(time.time() - start_time >= 1.0):
-                start_time = time.time()
-                fps_avg = processed_frames - processed_frames_1
-                processed_frames_1 = processed_frames
-            print(f"Progress: {progress:.1f}% ({processed_frames}/{len(image_files)}), Avg FPS: {fps_avg:.1f}", end="\r")
+            if self.show_display:
+                cv2.imshow("TennIQ Analysis", result_frame)
+                key = cv2.waitKey(30) & 0xFF
+                if key == ord("q"):
+                    break
 
-            # Present at specified FPS
-            if not self.presentation():
-                break
-
-        analysis_pool.shutdown()
+            self.prev_frame = frame.copy()
 
         if self.show_display:
             cv2.destroyAllWindows()
 
         self._print_analysis_summary()
+
+
 
     def analyze_video(self, video_path: str) -> None:
         """
@@ -684,13 +595,15 @@ class TennisAnalyzer:
                 self.frame_count += 1
                 
                 result_frame = self._analyze_frame(frame)
-                
-                # Add result to presentation queue
-                self.presentation_results.append(result_frame)
 
-                # Present at specified FPS
-                if not self.presentation():
-                    break
+                if self.show_display:
+                    cv2.imshow("TennIQ Analysis", result_frame)
+                    key = cv2.waitKey(1) & 0xFF
+                    if key == ord("q"):
+                        break
+                    elif key == ord("s"):
+                        cv2.imwrite(f"frame_{self.frame_count:06d}.jpg", result_frame)
+                        logger.info(f"Saved frame {self.frame_count}")
 
                 if out_writer:
                     out_writer.write(result_frame)
@@ -703,7 +616,7 @@ class TennisAnalyzer:
                     f"Avg FPS: {fps_avg:.1f}"
                 )
 
-                self.prev_frame = frame
+                self.prev_frame = frame.copy()
 
         except KeyboardInterrupt:
             logger.info("Analysis interrupted by user")
@@ -768,12 +681,7 @@ def main():
         help="Path to a custom fine-tuned YOLO model (.pt) for player tracking.",
     )
 
-    parser.add_argument(
-        "--fps",
-        type=int,
-        default=24,
-        help="Presentation FPS for display (default: 30)",
-    )
+
 
     parser.add_argument(
         "--weights",
@@ -785,7 +693,7 @@ def main():
     parser.add_argument(
         "--model-name",
         type=str,
-        default="TrackNetV4_TypeA",
+        default="TrackNetV5_TypeA",
         choices=['Baseline_TrackNetV2', 'TrackNetV4_TypeA', 'TrackNetV4_TypeB', 'TrackNetV5'],
         help="Name of the ball tracking model to use.",
     )
@@ -806,7 +714,6 @@ def main():
         analyzer.output_path = args.output
     if args.calib_frames is not None:
         analyzer.calib_frames = args.calib_frames
-    analyzer.set_presentation_fps(args.fps)
     
     if args.exp_pred is not None and analyzer.player_tracker:
         analyzer.player_tracker.exponential_prediction = args.exp_pred
@@ -815,6 +722,7 @@ def main():
     if args.player_model is not None and analyzer.player_tracker:
         analyzer.player_model_path = args.player_model
         analyzer.player_tracker = PlayerTracker(model_path=args.player_model, max_distance=analyzer.player_max_distance, max_lost_frames=analyzer.player_max_lost_frames, exponential_prediction=analyzer.player_exp_pred)
+
 
     if args.weights and analyzer.ball_tracker:
         ball_config = {

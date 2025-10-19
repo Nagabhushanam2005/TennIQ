@@ -206,5 +206,11 @@ elif [[ "$ACTION" == "demo" ]]; then
     if [[ -z "$CONFIG_FILE" ]]; then
         CONFIG_FILE="inference/config/config_test.txt"
     fi
-    $PYTHON_EXEC -m inference.inference_main --config "$CONFIG_FILE" --input "$FRAMES_DIR" --mode images --model-name TrackNetV4_TypeA --weights models/TrackNetV4_TypeA_epoch_41.pth --player-model "yolo_train/player_detection/yolo11n_player_finetune4/weights/best.pt" --bounce-model "models/ctb_regr_bounce.cbm"
+    $PYTHON_EXEC -m inference.inference_main --config "$CONFIG_FILE" \
+                --input "$FRAMES_DIR" \
+                --mode images \
+                --model-name TrackNetV4_TypeA \
+                --weights models/TrackNetV4_TypeA_epoch_47.pth \
+                --player-model "yolo_train/player_detection/yolo11n_player_finetune4/weights/best.pt" \
+                --bounce-model "models/ctb_regr_bounce.cbm"
 fi

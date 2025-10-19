@@ -204,6 +204,14 @@ class EventDetector:
     def get_events(self) -> Dict[int, List[Dict]]:
         return self.events
 
+    def get_bounce_positions(self) -> Dict[int, Tuple[int, int]]:
+        bounces = {}
+        for frame_num, event_list in self.events.items():
+            for event in event_list:
+                if event.get("type") == "BOUNCE" and event.get("position") is not None:
+                    bounces[frame_num] = tuple(event.get("position"))
+        return bounces
+
     def draw_events(self, frame: np.ndarray) -> np.ndarray:
         result_frame = frame.copy()
 
