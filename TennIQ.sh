@@ -2,7 +2,7 @@
 
 show_help() {
     echo "TennIQ"
-    echo "=============================="
+    echo "==========================================="
     echo "Usage: $0 [--setup|--import|--infer|--demo] [--config FILE|-c FILE] [--input FILE|-i FILE]"
     echo ""
     echo "Commands:"
@@ -17,6 +17,13 @@ show_help() {
     echo "  --output FILE, -o FILE     Output video file (for inference)"
     echo "  --no-display               Run without display window"
     echo "  --mode MODE                Analysis mode: 'video' or 'images' (default: video)"
+    echo "  --fps FPS                  Presentation FPS for display (default: 30)"
+    echo "  --calib-frames NUM         Number of calibration frames"
+    echo "  --exp-pred FLOAT           Exponential prediction weight for player tracking"
+    echo "  --player-model FILE        Path to custom YOLO model for player tracking"
+    echo "  --weights FILE             Path to ball tracking model weights"
+    echo "  --model-name NAME          Ball tracking model name"
+    echo "  --bounce-model FILE        Path to bounce detection model"
     echo ""
     echo "Examples:"
     echo "  $0 --setup                                    # Setup environment"
@@ -45,6 +52,9 @@ matplotlib
 scikit-learn
 filterpy
 ultralytics
+catboost
+torch
+torchvision
 EOF
     fi
 
@@ -71,6 +81,13 @@ INPUT_FILE=""
 OUTPUT_FILE=""
 NO_DISPLAY=""
 MODE="video"
+FPS=""
+CALIB_FRAMES=""
+EXP_PRED=""
+PLAYER_MODEL=""
+WEIGHTS=""
+MODEL_NAME=""
+BOUNCE_MODEL=""
 
 
 if [[ -z "$PYTHON_EXEC" ]]; then
@@ -137,6 +154,69 @@ while [[ $# -gt 0 ]]; do
                 show_help
             fi
             ;;
+        --fps)
+            if [[ -n "$2" ]]; then
+                FPS="--fps $2"
+                shift 2
+            else
+                echo "Error: --fps requires a numeric argument."
+                show_help
+            fi
+            ;;
+        --calib-frames)
+            if [[ -n "$2" ]]; then
+                CALIB_FRAMES="--calib-frames $2"
+                shift 2
+            else
+                echo "Error: --calib-frames requires a numeric argument."
+                show_help
+            fi
+            ;;
+        --exp-pred)
+            if [[ -n "$2" ]]; then
+                EXP_PRED="--exp-pred $2"
+                shift 2
+            else
+                echo "Error: --exp-pred requires a numeric argument."
+                show_help
+            fi
+            ;;
+        --player-model)
+            if [[ -n "$2" ]]; then
+                PLAYER_MODEL="--player-model \"$2\""
+                shift 2
+            else
+                echo "Error: --player-model requires a file argument."
+                show_help
+            fi
+            ;;
+        --weights)
+            if [[ -n "$2" ]]; then
+                WEIGHTS="--weights \"$2\""
+                shift 2
+            else
+                echo "Error: --weights requires a file argument."
+                show_help
+            fi
+            ;;
+        --model-name)
+            if [[ -n "$2" ]]; then
+                MODEL_NAME="--model-name $2"
+                shift 2
+            else
+                echo "Error: --model-name requires a model name argument."
+                show_help
+            fi
+            ;;
+        --bounce-model)
+            if [[ -n "$2" ]]; then
+                BOUNCE_MODEL="--bounce-model \"$2\""
+                shift 2
+            else
+                echo "Error: --bounce-model requires a file argument."
+                show_help
+            fi
+            ;;
         --help)
             show_help
             shift
@@ -163,13 +243,20 @@ if [[ "$ACTION" == "infer" ]] && [[ -z "$INPUT_FILE" ]]; then
     show_help
 fi
 
-echo "TennIQ Tennis Analysis System"
-echo "============================="
+echo "TennIQ"
+echo "==========================================="
 echo "Action: $ACTION"
 [[ -n "$CONFIG_FILE" ]] && echo "Config: $CONFIG_FILE"
 [[ -n "$INPUT_FILE" ]] && echo "Input: $INPUT_FILE"
 [[ -n "$OUTPUT_FILE" ]] && echo "Output: $OUTPUT_FILE"
 [[ -n "$MODE" ]] && echo "Mode: $MODE"
+[[ -n "$FPS" ]] && echo "FPS: $FPS"
+[[ -n "$CALIB_FRAMES" ]] && echo "Calib Frames: $CALIB_FRAMES"
+[[ -n "$EXP_PRED" ]] && echo "Exp Pred: $EXP_PRED"
+[[ -n "$PLAYER_MODEL" ]] && echo "Player Model: $PLAYER_MODEL"
+[[ -n "$WEIGHTS" ]] && echo "Weights: $WEIGHTS"
+[[ -n "$MODEL_NAME" ]] && echo "Model Name: $MODEL_NAME"
+[[ -n "$BOUNCE_MODEL" ]] && echo "Bounce Model: $BOUNCE_MODEL"
 echo ""
 
 if [[ "$ACTION" != "setup" ]]; then
@@ -191,10 +278,18 @@ elif [[ "$ACTION" == "infer" ]]; then
     [[ -n "$CONFIG_FILE" ]] && INFER_CMD="$INFER_CMD --config \"$CONFIG_FILE\""
     [[ -n "$OUTPUT_FILE" ]] && INFER_CMD="$INFER_CMD --output \"$OUTPUT_FILE\""
     [[ -n "$NO_DISPLAY" ]] && INFER_CMD="$INFER_CMD $NO_DISPLAY"
+    [[ -n "$FPS" ]] && INFER_CMD="$INFER_CMD $FPS"
+    [[ -n "$CALIB_FRAMES" ]] && INFER_CMD="$INFER_CMD $CALIB_FRAMES"
+    [[ -n "$EXP_PRED" ]] && INFER_CMD="$INFER_CMD $EXP_PRED"
+    [[ -n "$PLAYER_MODEL" ]] && INFER_CMD="$INFER_CMD $PLAYER_MODEL"
+    [[ -n "$WEIGHTS" ]] && INFER_CMD="$INFER_CMD $WEIGHTS"
+    [[ -n "$MODEL_NAME" ]] && INFER_CMD="$INFER_CMD $MODEL_NAME"
+    [[ -n "$BOUNCE_MODEL" ]] && INFER_CMD="$INFER_CMD $BOUNCE_MODEL"
 
     eval $INFER_CMD
 elif [[ "$ACTION" == "demo" ]]; then
     echo "Running demo analysis..."
+
     # FRAMES_DIR="data/web-scrapping/frames_test"
     FRAMES_DIR="TrackNetv4/data/tennis/Dataset/game9/Clip2"
     if [[ ! -d "$FRAMES_DIR" ]]; then
@@ -206,11 +301,48 @@ elif [[ "$ACTION" == "demo" ]]; then
     if [[ -z "$CONFIG_FILE" ]]; then
         CONFIG_FILE="inference/config/config_test.txt"
     fi
-    $PYTHON_EXEC -m inference.inference_main --config "$CONFIG_FILE" \
-                --input "$FRAMES_DIR" \
-                --mode images \
-                --model-name TrackNetV4_TypeA \
-                --weights models/TrackNetV4_TypeA_epoch_47.pth \
-                --player-model "yolo_train/player_detection/yolo11n_player_finetune4/weights/best.pt" \
-                --bounce-model "models/ctb_regr_bounce.cbm"
+    
+    DEMO_CMD="$PYTHON_EXEC -m inference.inference_main --config \"$CONFIG_FILE\" --input \"$FRAMES_DIR\" --mode images"
+    
+    [[ -n "$FPS" ]] && DEMO_CMD="$DEMO_CMD $FPS"
+    [[ -n "$CALIB_FRAMES" ]] && DEMO_CMD="$DEMO_CMD $CALIB_FRAMES"
+    [[ -n "$EXP_PRED" ]] && DEMO_CMD="$DEMO_CMD $EXP_PRED"
+    [[ -n "$NO_DISPLAY" ]] && DEMO_CMD="$DEMO_CMD $NO_DISPLAY"
+    if [[ -n "$MODEL_NAME" ]]; then
+        DEMO_CMD="$DEMO_CMD $MODEL_NAME"
+    else
+        echo "Available model options:"
+        echo "  --model-name yolo --weights \"yolo_train/ball_detection/yolo12n_ball_fine_tune3/weights/best.pt\""
+        echo "  --model-name TrackNetV4_TypeA --weights \"models/TrackNetV4_TypeA_epoch_47.pth\""
+        DEMO_CMD="$DEMO_CMD --model-name yolo"
+    fi
+
+    if [[ -n "$WEIGHTS" ]]; then
+        DEMO_CMD="$DEMO_CMD $WEIGHTS"
+    else
+        if [[ "$DEMO_CMD" == *"--model-name yolo"* ]]; then
+            DEMO_CMD="$DEMO_CMD --weights \"yolo_train/ball_detection/yolo12n_ball_fine_tune3/weights/best.pt\""
+        elif [[ "$DEMO_CMD" == *"--model-name TrackNetV4_TypeA"* ]]; then
+            DEMO_CMD="$DEMO_CMD --weights \"models/TrackNetV4_TypeA_epoch_47.pth\""
+        else
+            # Fallback to YOLO
+            DEMO_CMD="$DEMO_CMD --weights \"yolo_train/ball_detection/yolo12n_ball_fine_tune3/weights/best.pt\""
+        fi
+    fi
+
+    if [[ -n "$PLAYER_MODEL" ]]; then
+        DEMO_CMD="$DEMO_CMD $PLAYER_MODEL"
+    else
+        DEMO_CMD="$DEMO_CMD --player-model \"yolo_train/player_detection/yolo11n_player_finetune4/weights/best.pt\""
+    fi
+    
+    if [[ -n "$BOUNCE_MODEL" ]]; then
+        DEMO_CMD="$DEMO_CMD $BOUNCE_MODEL"
+    else
+        DEMO_CMD="$DEMO_CMD --bounce-model \"models/ctb_regr_bounce.cbm\""
+    fi
+    
+    echo "Running: $DEMO_CMD"
+    echo "==========================================="
+    eval $DEMO_CMD
 fi

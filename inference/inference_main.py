@@ -100,7 +100,7 @@ class TennisAnalyzer:
         self.output_path = self.config.get("OUTPUT_PATH", "/dev/null")
 
         self.frames = []
-        self.thread_pool = ThreadPoolExecutor(max_workers=5)
+        self.thread_pool = ThreadPoolExecutor(max_workers=3)
         self.tracking_futures = {}
         self.result_lock = threading.Lock()
         
@@ -150,7 +150,7 @@ class TennisAnalyzer:
     def presentation(self):
         current_time = time.time()
         
-        if current_time - self.last_presentation_time >= self.frame_interval:
+        if (current_time - self.last_presentation_time) > self.frame_interval:
             if self.presentation_results:
                 result_frame = self.presentation_results[-1]
                 
@@ -268,9 +268,9 @@ class TennisAnalyzer:
     def _update_player_tracking(self, frame: np.ndarray) -> None:
         """Update player tracking in parallel"""
         if self.enable_player_tracking and self.player_tracker:
-            start_time = time.time()
+            # start_time = time.time()
+            # print(time.time() - start_time)
             self.player_tracker.update(frame)
-            print(time.time() - start_time)
 
     def _update_ball_tracking(self, frames: List[np.ndarray]) -> None:
         """Update ball tracking in parallel"""
@@ -295,8 +295,7 @@ class TennisAnalyzer:
             lines = self.court_lines_frame_coords
             for i in range(0, len(lines), 4):
                 x1, y1, x2, y2 = lines[i],lines[i+1], lines[i+2], lines[i+3]
-                # Draw lines in White (255, 255, 255)
-                cv2.line(result_frame, (int(x1),int(y1)),(int(x2),int(y2)), (255, 255, 255), 2)
+                cv2.line(result_frame, (int(x1),int(y1)),(int(x2),int(y2)), (0, 255, 255), 2)
 
         # 3. Mark players
         if self.enable_player_tracking and self.player_tracker:
@@ -621,13 +620,12 @@ class TennisAnalyzer:
             
             progress = (processed_frames / len(image_files)) * 100
 
-            if(time.time() - start_time >= 1.0):
+            if(time.time() - start_time >= .99):
                 start_time = time.time()
                 fps_avg = processed_frames - processed_frames_1
                 processed_frames_1 = processed_frames
             print(f"Progress: {progress:.1f}% ({processed_frames}/{len(image_files)}), Avg FPS: {fps_avg:.1f}", end="\r")
 
-            # Present at specified FPS
             if not self.presentation():
                 break
 
@@ -772,7 +770,7 @@ def main():
         "--fps",
         type=int,
         default=24,
-        help="Presentation FPS for display (default: 30)",
+        help="Presentation FPS for display (default: 24)",
     )
 
     parser.add_argument(
@@ -786,7 +784,7 @@ def main():
         "--model-name",
         type=str,
         default="TrackNetV4_TypeA",
-        choices=['Baseline_TrackNetV2', 'TrackNetV4_TypeA', 'TrackNetV4_TypeB', 'TrackNetV5'],
+        choices=['yolo', 'TrackNetV4_TypeA', 'TrackNetV4_TypeB', 'TrackNetV5'],
         help="Name of the ball tracking model to use.",
     )
     parser.add_argument(

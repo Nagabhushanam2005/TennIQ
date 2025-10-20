@@ -9,5 +9,5 @@ OUTPUT_PATH="/dev/null"
 # Tracking Options (true/false)
 ENABLE_BALL_TRACKING=true
 ENABLE_PLAYER_TRACKING=true
-ENABLE_COURT_TRACKING=false
+ENABLE_COURT_TRACKING=true
 
