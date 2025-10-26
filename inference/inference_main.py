@@ -99,7 +99,6 @@ class TennisAnalyzer:
         self.save_output = self.config.get("SAVE_OUTPUT", False)
         self.output_path = self.config.get("OUTPUT_PATH", "/dev/null")
 
-        self.frames = []
         self.thread_pool = ThreadPoolExecutor(max_workers=3)
         self.tracking_futures = {}
         self.result_lock = threading.Lock()
@@ -274,7 +273,7 @@ class TennisAnalyzer:
 
     def _update_ball_tracking(self, frames: List[np.ndarray]) -> None:
         """Update ball tracking in parallel"""
-        if self.enable_ball_tracking and self.ball_tracker and len(frames) == 3:
+        if self.enable_ball_tracking and self.ball_tracker:
             self.ball_tracker.update(frames)
 
     def _update_event_detection(self) -> None:
@@ -320,40 +319,27 @@ class TennisAnalyzer:
             Annotated frame with analysis results
         """
         frame_id = self.frame_count
-        
-        # Update frame buffer for ball tracking
-        if self.enable_ball_tracking:
-            if len(self.frames) < 3:
-                self.frames.append(frame)
-            if len(self.frames) == 3:
-                ball_frames = self.frames
-                self.frames = [self.frames[1], self.frames[2]]
-            else:
-                ball_frames = None
-        else:
-            ball_frames = None
-
         futures = []
         
         # Player tracking
         if self.enable_player_tracking:
-            player_future = self.thread_pool.submit(self._update_player_tracking, frame)
-            futures.append(player_future)
-        
+            # player_future = self.thread_pool.submit(self._update_player_tracking, frame)
+            # futures.append(player_future)
+            self.player_tracker.update(frame)
         # Ball tracking
-        if self.enable_ball_tracking and ball_frames:
-            ball_future = self.thread_pool.submit(self._update_ball_tracking, ball_frames)
+        if self.enable_ball_tracking:
+            ball_future = self.thread_pool.submit(self._update_ball_tracking, frame)
             futures.append(ball_future)
         
         # Event detection
         if self.enable_event_detection:
-            event_future = self.thread_pool.submit(self._update_event_detection)
-            futures.append(event_future)
+            # event_future = self.thread_pool.submit(self._update_event_detection)
+            # futures.append(event_future)
+            self.event_detector.update()
         
         for future in futures:
             future.result()
         result_frame = self._draw_annotations(frame)
-        # Add info overlay (fast operation)
 
         result_frame = self._draw_info_overlay(result_frame)
 
@@ -578,7 +564,7 @@ class TennisAnalyzer:
 
         
         # Create a separate thread pool for frame analysis
-        analysis_pool = ThreadPoolExecutor(max_workers=3)
+        analysis_pool = ThreadPoolExecutor(max_workers=2)
         frame_queue = queue.Queue()
         start_time = time.time()
         submitted_frames = 0
@@ -608,26 +594,25 @@ class TennisAnalyzer:
             frame_queue.put((i, future))
             submitted_frames += 1
 
-        # Process any remaining frames in queue
-        while not frame_queue.empty():
-            frame_idx, future = frame_queue.get()
-            _, result_frame = future.result()
-            
-            self.presentation_results.append(result_frame)
-            
-            self.frame_count = frame_idx + 1
-            processed_frames += 1
-            
-            progress = (processed_frames / len(image_files)) * 100
+            if frame_queue.qsize() >= 5:
+                frame_idx, future = frame_queue.get()
+                _, result_frame = future.result()
+                
+                self.presentation_results.append(result_frame)
+                
+                self.frame_count = frame_idx + 1
+                processed_frames += 1
+                
+                progress = (processed_frames / len(image_files)) * 100
 
-            if(time.time() - start_time >= .99):
-                start_time = time.time()
-                fps_avg = processed_frames - processed_frames_1
-                processed_frames_1 = processed_frames
-            print(f"Progress: {progress:.1f}% ({processed_frames}/{len(image_files)}), Avg FPS: {fps_avg:.1f}", end="\r")
+                if(time.time() - start_time >= .99):
+                    start_time = time.time()
+                    fps_avg = processed_frames - processed_frames_1
+                    processed_frames_1 = processed_frames
+                print(f"Progress: {progress:.1f}% ({processed_frames}/{len(image_files)}), Avg FPS: {fps_avg:.1f}", end="\r")
 
-            if not self.presentation():
-                break
+                if not self.presentation():
+                    break
 
         analysis_pool.shutdown()
 

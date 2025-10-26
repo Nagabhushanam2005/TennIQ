@@ -23,6 +23,7 @@ class BallTracker:
         self.model_type = None
         self.conf_threshold = 0.05
         self.target_class_name = "ball"
+        self.frames_buffer = []
 
     def update_config(self, config):
         model_weights = config.get("BALL_MODEL_WEIGHTS")
@@ -61,14 +62,21 @@ class BallTracker:
         except Exception as e:
             logger.error(f"Failed to load TrackNet model: {e}")
 
-    def update(self, frames):
+    def update(self, frame):
         if not self.model_loaded:
             return
+        if len(self.frames_buffer) < 3:
+            self.frames_buffer.append(frame)
+        if len(self.frames_buffer) == 3:
+            frames = self.frames_buffer
+            # self.frames = [self.frames[1], self.frames[2]]
+            self.frames_buffer = [self.frames_buffer[2]]
+            # self.frames = []
 
-        if self.model_type == 'yolo':
-            self._update_yolo(frames)
-        else:
-            self._update_tracknet(frames)
+            if self.model_type == 'yolo':
+                self._update_yolo(frames)
+            else:
+                self._update_tracknet(frames)
 
     def _update_yolo(self, frames):
         """YOLO-based ball tracking"""
@@ -134,7 +142,8 @@ class BallTracker:
 
             if isinstance(ball_preds, tuple):
                 ball_preds = ball_preds[0]
-        ball_predictions = ball_preds.cpu()
+        # ball_predictions = ball_preds.cpu()
+        ball_predictions = ball_preds.to("cpu", non_blocking=True)
         self._process_predictions(ball_predictions, frames[2])
 
     def _calculate_ratios(self, frame):
