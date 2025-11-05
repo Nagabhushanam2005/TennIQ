@@ -290,8 +290,8 @@ elif [[ "$ACTION" == "infer" ]]; then
 elif [[ "$ACTION" == "demo" ]]; then
     echo "Running demo analysis..."
 
-    # FRAMES_DIR="data/web-scrapping/frames_test"
     FRAMES_DIR="TrackNetv4/data/tennis/Dataset/game9/Clip2"
+    FRAMES_DIR="data/web-scrapping/frames_test"
     if [[ ! -d "$FRAMES_DIR" ]]; then
         echo "Error: Frames directory not found: $FRAMES_DIR"
         echo "Please run: $0 --import -c <config_file> first"
@@ -313,7 +313,7 @@ elif [[ "$ACTION" == "demo" ]]; then
     else
         echo "Available model options:"
         echo "  --model-name yolo --weights \"yolo_train/ball_detection/yolo12n_ball_fine_tune3/weights/best.pt\""
-        echo "  --model-name TrackNetV4_TypeA --weights \"models/TrackNetV4_TypeA_epoch_47.pth\""
+        echo "  --model-name TrackNetV4_TypeA --weights \"models/TrackNetV4_TypeA_epoch_182.pth\""
         DEMO_CMD="$DEMO_CMD --model-name yolo"
     fi
 
@@ -323,7 +323,7 @@ elif [[ "$ACTION" == "demo" ]]; then
         if [[ "$DEMO_CMD" == *"--model-name yolo"* ]]; then
             DEMO_CMD="$DEMO_CMD --weights \"yolo_train/ball_detection/yolo12n_ball_fine_tune3/weights/best.pt\""
         elif [[ "$DEMO_CMD" == *"--model-name TrackNetV4_TypeA"* ]]; then
-            DEMO_CMD="$DEMO_CMD --weights \"models/TrackNetV4_TypeA_epoch_47.pth\""
+            DEMO_CMD="$DEMO_CMD --weights \"models/TrackNetV4_TypeA_epoch_182.pth\""
         else
             # Fallback to YOLO
             DEMO_CMD="$DEMO_CMD --weights \"yolo_train/ball_detection/yolo12n_ball_fine_tune3/weights/best.pt\""
@@ -339,8 +339,9 @@ elif [[ "$ACTION" == "demo" ]]; then
     if [[ -n "$BOUNCE_MODEL" ]]; then
         DEMO_CMD="$DEMO_CMD $BOUNCE_MODEL"
     else
-        DEMO_CMD="$DEMO_CMD --bounce-model \"models/ctb_regr_bounce.cbm\""
+        DEMO_CMD="$DEMO_CMD --bounce-model \"models/ctb_regr_bounce.cbm\" --ball-fill-path \"models/ball_fill_model.joblib\""
     fi
+
     
     echo "Running: $DEMO_CMD"
     echo "==========================================="

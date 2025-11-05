@@ -778,6 +778,12 @@ def main():
         default=None,
         help="Path to the trained CatBoost model (.cbm) for bounce detection.",
     )
+    parser.add_argument(
+        "--ball-fill-path",
+        type=str,
+        default=None,
+        help="Path to the trained CatBoost model (.cbm) for ball fill detection.",
+    )
     args = parser.parse_args()
 
     # Initialize
@@ -802,7 +808,8 @@ def main():
     if args.weights and analyzer.ball_tracker:
         ball_config = {
             "BALL_MODEL_WEIGHTS": args.weights,
-            "BALL_MODEL_NAME": args.model_name
+            "BALL_MODEL_NAME": args.model_name,
+            "CATBOOST_MODEL_PATH": args.ball_fill_path
         }
         analyzer.ball_tracker.update_config(ball_config)
 

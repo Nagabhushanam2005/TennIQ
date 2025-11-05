@@ -215,16 +215,33 @@ class EventDetector:
     def draw_events(self, frame: np.ndarray) -> np.ndarray:
         result_frame = frame.copy()
 
-        latest_bounce_frame = max(self.events.keys()) if self.events else -1
+        # Flatten all events into a single list and sort by frame number
+        all_events = [event for event_list in self.events.values() for event in event_list]
+        all_events.sort(key=lambda e: e['frame'])
 
-        for frame_num, event_list in self.events.items():
-            for event in event_list:
-                if event["type"] == "BOUNCE":
-                    pos = event["position"]
-                    if pos is not None: 
-                        if frame_num == latest_bounce_frame:
-                            cv2.circle(result_frame, pos, 10, (0, 255, 255), 5)
-                        else:
-                            cv2.circle(result_frame, pos, 8, (0, 125, 255), -1)
-                            
+        # Get the last 10 events
+        last_10_events = all_events[-10:]
+
+        # Find the latest bounce frame among all events to highlight it
+        latest_bounce_frame = -1
+        if self.events:
+            bounce_frames = [
+                frame_num for frame_num, event_list in self.events.items() 
+                if any(e.get("type") == "BOUNCE" for e in event_list)
+            ]
+            if bounce_frames:
+                latest_bounce_frame = max(bounce_frames)
+
+        for event in last_10_events:
+            if event["type"] == "BOUNCE":
+                pos = event.get("position")
+                if pos:
+                    pos = tuple(pos[:2])
+                    frame_num = event["frame"]
+                    if frame_num == latest_bounce_frame:
+                        # Highlight the latest bounce
+                        cv2.circle(result_frame, pos, 10, (0, 255, 255), 5)
+                    else:
+                        # Draw other recent bounces
+                        cv2.circle(result_frame, pos, 8, (0, 125, 255), -1)
         return result_frame
