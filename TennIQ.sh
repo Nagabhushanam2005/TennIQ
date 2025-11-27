@@ -274,24 +274,18 @@ elif [[ "$ACTION" == "import" ]]; then
     $PYTHON_EXEC data/web-scrapping/web-scrapping.py --config "$CONFIG_FILE"
 elif [[ "$ACTION" == "infer" ]]; then
     echo "Running tennis analysis inference..."
+    # Keep CLI minimal: most runtime options should be set in the config file
     INFER_CMD="$PYTHON_EXEC -m inference.inference_main --input \"$INPUT_FILE\" --mode $MODE"
     [[ -n "$CONFIG_FILE" ]] && INFER_CMD="$INFER_CMD --config \"$CONFIG_FILE\""
     [[ -n "$OUTPUT_FILE" ]] && INFER_CMD="$INFER_CMD --output \"$OUTPUT_FILE\""
     [[ -n "$NO_DISPLAY" ]] && INFER_CMD="$INFER_CMD $NO_DISPLAY"
-    [[ -n "$FPS" ]] && INFER_CMD="$INFER_CMD $FPS"
-    [[ -n "$CALIB_FRAMES" ]] && INFER_CMD="$INFER_CMD $CALIB_FRAMES"
-    [[ -n "$EXP_PRED" ]] && INFER_CMD="$INFER_CMD $EXP_PRED"
-    [[ -n "$PLAYER_MODEL" ]] && INFER_CMD="$INFER_CMD $PLAYER_MODEL"
-    [[ -n "$WEIGHTS" ]] && INFER_CMD="$INFER_CMD $WEIGHTS"
-    [[ -n "$MODEL_NAME" ]] && INFER_CMD="$INFER_CMD $MODEL_NAME"
-    [[ -n "$BOUNCE_MODEL" ]] && INFER_CMD="$INFER_CMD $BOUNCE_MODEL"
 
     eval $INFER_CMD
 elif [[ "$ACTION" == "demo" ]]; then
     echo "Running demo analysis..."
 
     FRAMES_DIR="TrackNetv4/data/tennis/Dataset/game9/Clip2"
-    FRAMES_DIR="data/web-scrapping/frames_test"
+    # FRAMES_DIR="data/web-scrapping/frames_test"
     if [[ ! -d "$FRAMES_DIR" ]]; then
         echo "Error: Frames directory not found: $FRAMES_DIR"
         echo "Please run: $0 --import -c <config_file> first"
@@ -304,43 +298,8 @@ elif [[ "$ACTION" == "demo" ]]; then
     
     DEMO_CMD="$PYTHON_EXEC -m inference.inference_main --config \"$CONFIG_FILE\" --input \"$FRAMES_DIR\" --mode images"
     
-    [[ -n "$FPS" ]] && DEMO_CMD="$DEMO_CMD $FPS"
-    [[ -n "$CALIB_FRAMES" ]] && DEMO_CMD="$DEMO_CMD $CALIB_FRAMES"
-    [[ -n "$EXP_PRED" ]] && DEMO_CMD="$DEMO_CMD $EXP_PRED"
     [[ -n "$NO_DISPLAY" ]] && DEMO_CMD="$DEMO_CMD $NO_DISPLAY"
-    if [[ -n "$MODEL_NAME" ]]; then
-        DEMO_CMD="$DEMO_CMD $MODEL_NAME"
-    else
-        echo "Available model options:"
-        echo "  --model-name yolo --weights \"yolo_train/ball_detection/yolo12n_ball_fine_tune3/weights/best.pt\""
-        echo "  --model-name TrackNetV4_TypeA --weights \"models/TrackNetV4_TypeA_epoch_182.pth\""
-        DEMO_CMD="$DEMO_CMD --model-name yolo"
-    fi
-
-    if [[ -n "$WEIGHTS" ]]; then
-        DEMO_CMD="$DEMO_CMD $WEIGHTS"
-    else
-        if [[ "$DEMO_CMD" == *"--model-name yolo"* ]]; then
-            DEMO_CMD="$DEMO_CMD --weights \"yolo_train/ball_detection/yolo12n_ball_fine_tune3/weights/best.pt\""
-        elif [[ "$DEMO_CMD" == *"--model-name TrackNetV4_TypeA"* ]]; then
-            DEMO_CMD="$DEMO_CMD --weights \"models/TrackNetV4_TypeA_epoch_182.pth\""
-        else
-            # Fallback to YOLO
-            DEMO_CMD="$DEMO_CMD --weights \"yolo_train/ball_detection/yolo12n_ball_fine_tune3/weights/best.pt\""
-        fi
-    fi
-
-    if [[ -n "$PLAYER_MODEL" ]]; then
-        DEMO_CMD="$DEMO_CMD $PLAYER_MODEL"
-    else
-        DEMO_CMD="$DEMO_CMD --player-model \"yolo_train/player_detection/yolo11n_player_finetune4/weights/best.pt\""
-    fi
-    
-    if [[ -n "$BOUNCE_MODEL" ]]; then
-        DEMO_CMD="$DEMO_CMD $BOUNCE_MODEL"
-    else
-        DEMO_CMD="$DEMO_CMD --bounce-model \"models/ctb_regr_bounce.cbm\" --ball-fill-path \"models/ball_fill_model.joblib\""
-    fi
+    # Note: demo-specific model/weight choices should be configured in the config file
 
     
     echo "Running: $DEMO_CMD"

@@ -6,8 +6,29 @@ SHOW_DISPLAY=true
 SAVE_OUTPUT=false
 OUTPUT_PATH="/dev/null"
 
+# Presentation FPS for output writer (if different from FPS)
+PRESENTATION_FPS=24
+
+# Number of frames used for court/player calibration
+CALIB_FRAMES=10
+
+# Player tracking prediction weight
+PLAYER_EXPONENTIAL_PREDICTION=1.0
+
+# Optional overrides for model paths (put actual paths to use)
+# Path to custom player detector model (.pt)
+PLAYER_MODEL_PATH="yolo_train/player_detection/yolo11n_player_finetune4/weights/best.pt"
+
+# Ball model weights and name
+BALL_MODEL_WEIGHTS="models/TrackNetV4_TypeA_epoch_182.pth"
+BALL_MODEL_NAME="TrackNetV4_TypeA"
+
+# Event/bounce detection model (CatBoost .cbm) and ball-fill model
+BOUNCE_MODEL_PATH="models/catboost_status_model.cbm"
+BALL_FILL_PATH="models/ball_fill_model.joblib"
+
 # Tracking Options (true/false)
 ENABLE_BALL_TRACKING=true
 ENABLE_PLAYER_TRACKING=true
-ENABLE_COURT_TRACKING=true
+ENABLE_COURT_TRACKING=false
 

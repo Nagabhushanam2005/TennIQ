@@ -45,7 +45,7 @@ class TennisAnalyzer:
         self.player_max_lost_frames = self.config.get("PLAYER_MAX_LOST_FRAMES", 10)
         self.player_exp_pred = self.config.get("PLAYER_EXPONENTIAL_PREDICTION", 1.0)
         self.player_model_path = self.config.get("PLAYER_MODEL_PATH", 'yolo11n.pt')
-        self.bounce_model_path = self.config.get("BOUNCE_MODEL_PATH")
+        self.event_model_path = self.config.get("BOUNCE_MODEL_PATH")
 
         self.enable_event_detection = True
 
@@ -84,7 +84,7 @@ class TennisAnalyzer:
         if self.enable_event_detection:
             self.event_detector = EventDetector(
                 self.ball_tracker, 
-                bounce_model_path=self.bounce_model_path
+                event_model_path=self.event_model_path
             )
         else:
             self.event_detector = None
@@ -98,6 +98,8 @@ class TennisAnalyzer:
         self.show_display = self.config.get("SHOW_DISPLAY", True)
         self.save_output = self.config.get("SAVE_OUTPUT", False)
         self.output_path = self.config.get("OUTPUT_PATH", "/dev/null")
+        self.out_writer: Optional[cv2.VideoWriter] = None
+        self.output_dir: Optional[str] = None
 
         self.thread_pool = ThreadPoolExecutor(max_workers=3)
         self.tracking_futures = {}
@@ -152,12 +154,11 @@ class TennisAnalyzer:
         if (current_time - self.last_presentation_time) > self.frame_interval:
             if self.presentation_results:
                 result_frame = self.presentation_results[-1]
-                
-                if self.show_display:
-                    cv2.imshow("TennIQ Analysis", result_frame)
-                    key = cv2.waitKey(1) & 0xFF
-                    if key == ord("q"):
-                        return False
+                if self.out_writer is not None:
+                    try:
+                        self.out_writer.write(result_frame)
+                    except Exception:
+                        logger.exception("Failed to write frame to output writer")
                 
                 self.last_presentation_time = current_time
             
@@ -565,6 +566,7 @@ class TennisAnalyzer:
         
         # Create a separate thread pool for frame analysis
         analysis_pool = ThreadPoolExecutor(max_workers=2)
+        out_writer = None
         frame_queue = queue.Queue()
         start_time = time.time()
         submitted_frames = 0
@@ -581,13 +583,25 @@ class TennisAnalyzer:
             frame = cv2.imread(image_path)
             if frame is None:
                 continue
-
-            # Court detection for first frame only
-            if i == 0 and self.enable_court_tracking and self.court_warp_matrix is None:
-                self.court_detector.detect(frame)
-                self.court_lines_frame_coords = self.court_detector.lines
-                self.court_warp_matrix = self.court_detector.court_warp_matrix[-1] if self.court_detector.court_warp_matrix else None
-                self.game_warp_matrix = self.court_detector.game_warp_matrix[-1] if self.court_detector.game_warp_matrix else None
+            
+            # first frame
+            if i == 0:
+                # initialize writer on first available frame
+                if self.save_output and self.output_path and self.out_writer is None:
+                    try:
+                        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                        # result_frame shape is (H,W,3)
+                        out_writer = cv2.VideoWriter(self.output_path, fourcc, self.fps, (frame.shape[1], frame.shape[0]))
+                        self.out_writer = out_writer
+                    except Exception:
+                        logger.exception("Failed to create VideoWriter for image sequence")
+                
+                if self.enable_court_tracking and self.court_warp_matrix is None:
+                    # Court detection for first frame only
+                    self.court_detector.detect(frame)
+                    self.court_lines_frame_coords = self.court_detector.lines
+                    self.court_warp_matrix = self.court_detector.court_warp_matrix[-1] if self.court_detector.court_warp_matrix else None
+                    self.game_warp_matrix = self.court_detector.game_warp_matrix[-1] if self.court_detector.game_warp_matrix else None
 
             # Submit frame for parallel processing
             future = analysis_pool.submit(process_frame, (i, image_path, frame))
@@ -597,9 +611,7 @@ class TennisAnalyzer:
             if frame_queue.qsize() >= 5:
                 frame_idx, future = frame_queue.get()
                 _, result_frame = future.result()
-                
                 self.presentation_results.append(result_frame)
-                
                 self.frame_count = frame_idx + 1
                 processed_frames += 1
                 
@@ -615,6 +627,10 @@ class TennisAnalyzer:
                     break
 
         analysis_pool.shutdown()
+
+        # release writer
+        if self.out_writer is not None:
+            self.out_writer.release()
 
         if self.show_display:
             cv2.destroyAllWindows()
@@ -649,12 +665,13 @@ class TennisAnalyzer:
         
         self._calibrate_court(cap, total_frames)
 
-        out_writer = None
+        # prepare output writer if requested
         if self.save_output and self.output_path:
-            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-            out_writer = cv2.VideoWriter(
-                self.output_path, fourcc, self.fps, (frame_width, frame_height)
-            )
+            try:
+                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                self.out_writer = cv2.VideoWriter(self.output_path, fourcc, self.fps, (frame_width, frame_height))
+            except Exception:
+                logger.exception("Failed to create VideoWriter for video output")
 
         start_time = time.time()
 
@@ -675,8 +692,8 @@ class TennisAnalyzer:
                 if not self.presentation():
                     break
 
-                if out_writer:
-                    out_writer.write(result_frame)
+                if self.out_writer:
+                    self.out_writer.write(result_frame)
 
                 progress = (self.frame_count / total_frames) * 100
                 elapsed = time.time() - start_time
@@ -693,8 +710,11 @@ class TennisAnalyzer:
 
         finally:
             cap.release()
-            if out_writer:
-                out_writer.release()
+            if self.out_writer:
+                try:
+                    self.out_writer.release()
+                except Exception:
+                    logger.exception("Failed to release out_writer")
             if self.show_display:
                 cv2.destroyAllWindows()
 
@@ -719,10 +739,8 @@ def main():
     parser.add_argument(
         "--input", "-i", required=True, help="Input video file or image directory path"
     )
-    parser.add_argument("--output", "-o", help="Output video file path (optional)")
-    parser.add_argument(
-        "--no-display", action="store_true", help="Disable display window"
-    )
+    parser.add_argument("--output", "-o", help="Optional output video file path (overrides config)")
+    parser.add_argument("--no-display", action="store_true", help="Disable display window")
     parser.add_argument(
         "--mode",
         choices=["video", "images"],
@@ -730,92 +748,46 @@ def main():
         help="Analysis mode: video file or image sequence",
     )
 
-    parser.add_argument(
-        "--calib-frames",
-        type=int,
-        default=None,
-        help="Override the number of calibration frames specified in the config",
-    )
-
-    parser.add_argument(
-        "--exp-pred",
-        type=float,
-        default=None,
-        help="Override the exponential prediction weight for player tracking (default is 1.0)",
-    )
-
-    parser.add_argument(
-        "--player-model",
-        type=str,
-        default=None,
-        help="Path to a custom fine-tuned YOLO model (.pt) for player tracking.",
-    )
-
-    parser.add_argument(
-        "--fps",
-        type=int,
-        default=24,
-        help="Presentation FPS for display (default: 24)",
-    )
-
-    parser.add_argument(
-        "--weights",
-        type=str,
-        default=None,
-        help="Path to the trained ball tracking model weights (.pth).",
-    )
-
-    parser.add_argument(
-        "--model-name",
-        type=str,
-        default="TrackNetV4_TypeA",
-        choices=['yolo', 'TrackNetV4_TypeA', 'TrackNetV4_TypeB', 'TrackNetV5'],
-        help="Name of the ball tracking model to use.",
-    )
-    parser.add_argument(
-        "--bounce-model",
-        type=str,
-        default=None,
-        help="Path to the trained CatBoost model (.cbm) for bounce detection.",
-    )
-    parser.add_argument(
-        "--ball-fill-path",
-        type=str,
-        default=None,
-        help="Path to the trained CatBoost model (.cbm) for ball fill detection.",
-    )
+    # Keep CLI surface minimal: most runtime options should live in the config file
     args = parser.parse_args()
 
-    # Initialize
-    analyzer = TennisAnalyzer(args.config)
-    analyzer.show_display = not args.no_display
+    # Prepare timestamped outputs directory and logging
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    out_dir = os.path.join("outputs", ts)
+    os.makedirs(out_dir, exist_ok=True)
 
+    # default output filenames inside the timestamped folder
+    output_video_path = os.path.join(out_dir, "inference.mp4")
+    output_log_path = os.path.join(out_dir, "inference.log")
+
+    # configure file logging
+    fh = logging.FileHandler(output_log_path)
+    fh.setLevel(logging.INFO)
+    fmt = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    fh.setFormatter(fmt)
+    root_logger = logging.getLogger()
+    root_logger.addHandler(fh)
+    root_logger.setLevel(logging.INFO)
+    logger.info(f"Logging initialized. Writing logs to: {output_log_path}")
+
+    # Initialize analyzer with config file (the config should contain most runtime options)
+    analyzer = TennisAnalyzer(args.config)
+
+    # Use timestamped output directory by default; allow --output to override
+    analyzer.output_dir = out_dir
+    analyzer.output_path = output_video_path
+    analyzer.save_output = True
+    analyzer.show_display = not args.no_display
     if args.output:
         analyzer.save_output = True
         analyzer.output_path = args.output
-    if args.calib_frames is not None:
-        analyzer.calib_frames = args.calib_frames
-    analyzer.set_presentation_fps(args.fps)
-    
-    if args.exp_pred is not None and analyzer.player_tracker:
-        analyzer.player_tracker.exponential_prediction = args.exp_pred
-        logger.info(f"Overriding PlayerTracker exponential_prediction to {args.exp_pred}")
 
-    if args.player_model is not None and analyzer.player_tracker:
-        analyzer.player_model_path = args.player_model
-        analyzer.player_tracker = PlayerTracker(model_path=args.player_model, max_distance=analyzer.player_max_distance, max_lost_frames=analyzer.player_max_lost_frames, exponential_prediction=analyzer.player_exp_pred)
-
-    if args.weights and analyzer.ball_tracker:
-        ball_config = {
-            "BALL_MODEL_WEIGHTS": args.weights,
-            "BALL_MODEL_NAME": args.model_name,
-            "CATBOOST_MODEL_PATH": args.ball_fill_path
-        }
-        analyzer.ball_tracker.update_config(ball_config)
-
-    if args.bounce_model is not None and analyzer.event_detector:
-        analyzer.event_detector.load_bounce_model(args.bounce_model)
-        analyzer.bounce_model_path = args.bounce_model
+    # Presentation FPS and other runtime options should come from the config file
+    fps_value = analyzer.config.get("PRESENTATION_FPS", analyzer.config.get("FPS", analyzer.presentation_fps))
+    try:
+        analyzer.set_presentation_fps(int(fps_value))
+    except Exception:
+        logger.warning("Invalid presentation FPS in config; using default")
 
     # Run
     if args.mode == "video":

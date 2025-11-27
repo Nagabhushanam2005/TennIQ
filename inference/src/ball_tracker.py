@@ -98,8 +98,8 @@ class BallTracker:
             else:
                 self._update_tracknet(frames)
 
-        elif len(self.frames_buffer) < 3 and self.catboost_loaded and len(self.predicted_points_queue) >= 6:
-            self._update_with_catboost(frame)
+        # elif len(self.frames_buffer) < 3 and self.catboost_loaded and len(self.predicted_points_queue) >= 6:
+        #     self._update_with_catboost(frame)
 
     def _update_with_catboost(self, frame):
         """Use CatBoost model to predict ball position when insufficient frames are available"""
