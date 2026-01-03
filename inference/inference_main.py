@@ -20,6 +20,7 @@ from inference.src.court_reference import CourtReference
 from inference.src.player_tracker import PlayerTracker 
 from inference.src.ball_tracker import BallTracker
 from inference.src.event_detection import EventDetector
+from inference.src.scoreboard import Scoreboard
 
 logging.basicConfig(level=logging.ERROR)
 logger = logging.getLogger(__name__)
@@ -46,6 +47,7 @@ class TennisAnalyzer:
         self.player_exp_pred = self.config.get("PLAYER_EXPONENTIAL_PREDICTION", 1.0)
         self.player_model_path = self.config.get("PLAYER_MODEL_PATH", 'yolo11n.pt')
         self.event_model_path = self.config.get("BOUNCE_MODEL_PATH")
+        self.enable_scoreboard = self.config.get("ENABLE_SCOREBOARD", True)
 
         self.enable_event_detection = True
 
@@ -89,7 +91,17 @@ class TennisAnalyzer:
         else:
             self.event_detector = None
 
-        # State
+        if self.enable_scoreboard:
+            self.scoreboard = Scoreboard(
+                frame_width=1280,
+                frame_height=720,
+                enable_auto_scoring=self.config.get("AUTO_SCORING", True),
+                rally_timeout_frames=self.config.get("RALLY_TIMEOUT_FRAMES", 50)
+            )
+        else:
+            self.scoreboard = None
+
+
         self.frame_count = 0
         self.fps = self.config.get("FPS", 30)
         self.prev_frame = None
@@ -149,29 +161,20 @@ class TennisAnalyzer:
         logger.info(f"Presentation FPS set to {fps}, frame interval: {self.frame_interval:.3f}s")
 
     def presentation(self):
-        current_time = time.time()
-        
-        if (current_time - self.last_presentation_time) > self.frame_interval:
-            if self.presentation_results:
-                result_frame = self.presentation_results[-1]
-                if self.out_writer is not None:
-                    try:
-                        self.out_writer.write(result_frame)
-                    except Exception:
-                        logger.exception("Failed to write frame to output writer")
-                
-                self.last_presentation_time = current_time
-            
+        if self.presentation_results:
+            result_frame = self.presentation_results[-1]
+            if self.out_writer is not None:
+                try:
+                    self.out_writer.write(result_frame)
+                except Exception:
+                    logger.exception("Failed to write frame to output writer")
+                    return False
             max_results = self.presentation_fps * 2
             while len(self.presentation_results) > max_results:
                 self.presentation_results.popleft()
-        
         return True
 
     def _calibrate_court(self, cap: cv2.VideoCapture, total_frames: int) -> None:
-        """
-        Calibrate the court and also perform player tracking calibration by processing the initial frames. 
-        """
         calib_frames = min(self.calib_frames, total_frames)
         if self.enable_player_tracking and self.player_tracker:
             self.player_tracker.calibration_max_frames = calib_frames
@@ -304,6 +307,13 @@ class TennisAnalyzer:
         # 4. Mark events
         if self.enable_event_detection and self.event_detector:
             result_frame = self.event_detector.draw_events(result_frame)
+        
+        # 5. Draw scoreboard
+        if self.enable_scoreboard and self.scoreboard:
+            player_positions = None
+            if self.enable_player_tracking and self.player_tracker:
+                player_positions = self.player_tracker.get_player_positions()
+            result_frame = self.scoreboard.draw_scoreboard(result_frame, player_positions)
 
         return result_frame
 
@@ -333,13 +343,40 @@ class TennisAnalyzer:
             futures.append(ball_future)
         
         # Event detection
+        new_events = []
         if self.enable_event_detection:
             # event_future = self.thread_pool.submit(self._update_event_detection)
             # futures.append(event_future)
-            self.event_detector.update()
+            new_events = self.event_detector.update()
         
         for future in futures:
             future.result()
+        
+        # Update scoreboard
+        if self.enable_scoreboard and self.scoreboard:
+            ball_pos = None
+            if self.enable_ball_tracking and self.ball_tracker:
+                ball_history = self.ball_tracker.get_ball_history()
+                if ball_history:
+                    ball_pos = ball_history[-1]
+            
+            player_positions = None
+            if self.enable_player_tracking and self.player_tracker:
+                player_positions = self.player_tracker.get_player_positions()
+            
+            # Update court bounds if available
+            if self.court_lines_frame_coords is not None and self.scoreboard.court_bounds is None:
+                self.scoreboard.set_court_bounds(self.court_lines_frame_coords.reshape(-1, 2))
+            
+            # TODO
+            self.scoreboard.set_court_bounds(None)
+
+            self.scoreboard.update(
+                ball_position=ball_pos,
+                player_positions=player_positions,
+                events=new_events
+            )
+        
         result_frame = self._draw_annotations(frame)
 
         result_frame = self._draw_info_overlay(result_frame)
@@ -692,6 +729,30 @@ class TennisAnalyzer:
                 if not self.presentation():
                     break
 
+                # Display frame if enabled
+                if self.show_display:
+                    cv2.imshow("TennIQ Analysis", result_frame)
+                    
+                    # Handle keyboard input for manual scoring
+                    key = cv2.waitKey(1) & 0xFF
+                    if key == ord('q'):
+                        logger.info("Quit requested by user")
+                        break
+                    elif key == ord('1') and self.scoreboard:
+                        # Award point to upper player (rear)
+                        from inference.src.scoreboard import Player
+                        self.scoreboard.manual_award_point(Player.UPPER)
+                    elif key == ord('2') and self.scoreboard:
+                        # Award point to lower player (front)
+                        from inference.src.scoreboard import Player
+                        self.scoreboard.manual_award_point(Player.LOWER)
+                    elif key == ord('r') and self.scoreboard:
+                        # Reset score
+                        self.scoreboard.reset_score()
+                    elif key == ord('h'):
+                        # Show help
+                        logger.info("Keyboard controls: 1=Point to P1(rear), 2=Point to P2(front), r=Reset score, q=Quit")
+
                 if self.out_writer:
                     self.out_writer.write(result_frame)
 
@@ -748,7 +809,6 @@ def main():
         help="Analysis mode: video file or image sequence",
     )
 
-    # Keep CLI surface minimal: most runtime options should live in the config file
     args = parser.parse_args()
 
     # Prepare timestamped outputs directory and logging
@@ -756,11 +816,9 @@ def main():
     out_dir = os.path.join("outputs", ts)
     os.makedirs(out_dir, exist_ok=True)
 
-    # default output filenames inside the timestamped folder
     output_video_path = os.path.join(out_dir, "inference.mp4")
     output_log_path = os.path.join(out_dir, "inference.log")
 
-    # configure file logging
     fh = logging.FileHandler(output_log_path)
     fh.setLevel(logging.INFO)
     fmt = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -781,8 +839,6 @@ def main():
     if args.output:
         analyzer.save_output = True
         analyzer.output_path = args.output
-
-    # Presentation FPS and other runtime options should come from the config file
     fps_value = analyzer.config.get("PRESENTATION_FPS", analyzer.config.get("FPS", analyzer.presentation_fps))
     try:
         analyzer.set_presentation_fps(int(fps_value))
