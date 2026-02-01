@@ -17,7 +17,8 @@ PLAYER_EXPONENTIAL_PREDICTION=1.0
 
 # Optional overrides for model paths (put actual paths to use)
 # Path to custom player detector model (.pt)
-PLAYER_MODEL_PATH="yolo_train/player_detection/yolo11n_player_finetune4/weights/best.pt"
+#PLAYER_MODEL_PATH="yolo_train/player_detection/yolo11n_player_finetune4/weights/best.pt"
+PLAYER_MODEL_PATH="models/player_best.pt"
 
 # Ball model weights and name
 BALL_MODEL_WEIGHTS="models/TrackNetV4_TypeA_epoch_182.pth"

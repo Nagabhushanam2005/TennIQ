@@ -1,11 +1,14 @@
 pytube
 yt-dlp
 numpy
+ultralytics
 opencv-python
+sympy
+joblib
+tqdm
 argparse
 scipy
 matplotlib
 scikit-learn
 filterpy
-ultralytics
 catboost

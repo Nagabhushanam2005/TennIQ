@@ -284,8 +284,8 @@ elif [[ "$ACTION" == "infer" ]]; then
 elif [[ "$ACTION" == "demo" ]]; then
     echo "Running demo analysis..."
 
-    FRAMES_DIR="TrackNetv4/data/tennis/Dataset/game9/Clip2"
-    # FRAMES_DIR="data/web-scrapping/frames_test"
+    # FRAMES_DIR="TrackNetv4/data/tennis/Dataset/game9/Clip2"
+    FRAMES_DIR="data/web-scrapping/frames_test"
     if [[ ! -d "$FRAMES_DIR" ]]; then
         echo "Error: Frames directory not found: $FRAMES_DIR"
         echo "Please run: $0 --import -c <config_file> first"
