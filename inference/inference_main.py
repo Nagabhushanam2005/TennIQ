@@ -15,7 +15,6 @@ from collections import deque
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from inference.src.court_detector import CourtDetector
-from inference.src.court_reference import CourtReference
 
 from inference.src.player_tracker import PlayerTracker 
 from inference.src.ball_tracker import BallTracker
@@ -40,7 +39,6 @@ class TennisAnalyzer:
         self.enable_player_tracking = self.config.get("ENABLE_PLAYER_TRACKING", True)
         self.enable_court_tracking = self.config.get("ENABLE_COURT_TRACKING", True)
         self.calib_frames = self.config.get("CALIB_FRAMES", 10)
-        self.court_homography_path = self.config.get("COURT_HOMOGRAPHY_PATH", "court_homography_matrices.npz")
         
         self.player_max_distance = self.config.get("PLAYER_MAX_DISTANCE", 25)
         self.player_max_lost_frames = self.config.get("PLAYER_MAX_LOST_FRAMES", 10)
@@ -49,11 +47,7 @@ class TennisAnalyzer:
         self.event_model_path = self.config.get("BOUNCE_MODEL_PATH")
         self.enable_scoreboard = self.config.get("ENABLE_SCOREBOARD", True)
 
-        self.enable_event_detection = True
-
-        self.court_warp_matrix: Optional[np.ndarray] = None
-        self.game_warp_matrix: Optional[np.ndarray] = None
-        self.court_lines_frame_coords: Optional[np.ndarray] = None
+        self.enable_event_detection = self.enable_ball_tracking and self.enable_player_tracking and self.enable_court_tracking
 
         if self.enable_player_tracking:
             self.player_tracker = PlayerTracker(
@@ -174,100 +168,6 @@ class TennisAnalyzer:
                 self.presentation_results.popleft()
         return True
 
-    def _calibrate_court(self, cap: cv2.VideoCapture, total_frames: int) -> None:
-        calib_frames = min(self.calib_frames, total_frames)
-        if self.enable_player_tracking and self.player_tracker:
-            self.player_tracker.calibration_max_frames = calib_frames
-            logger.info(f"Setting player tracker calibration frames to {calib_frames}")
-
-        if not self.enable_court_tracking or not self.court_detector:
-            logger.info("Court tracking disabled. Skipping court calibration.")
-            
-            if self.enable_player_tracking and self.player_tracker:
-                self._run_player_calibration(cap, calib_frames)
-                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                self.frame_count = 0 
-            return
-
-        logger.info(f'Starting court and player calibration on the first {calib_frames} frames...')
-        
-        court_calibrated = False
-        if os.path.exists(self.court_homography_path):
-            try:
-                data = np.load(self.court_homography_path)
-                self.court_warp_matrix = data['court_warp_matrix']
-                self.game_warp_matrix = data['game_warp_matrix']
-                
-                ret, frame = cap.read()
-                if ret:
-                    court_ref = self.court_detector.court_reference
-                    p = np.array(court_ref.get_important_lines(), dtype=np.float32).reshape((-1, 1, 2))
-                    self.court_lines_frame_coords = cv2.perspectiveTransform(p, self.court_warp_matrix).reshape(-1)
-                    
-                    if self.enable_player_tracking and self.player_tracker:
-                        self.player_tracker.update(frame) 
-                
-                logger.info(f"Loaded court homography from {self.court_homography_path}. Skipping court calibration.")
-                court_calibrated = True
-            except Exception as e:
-                logger.warning(f"Failed to load homography from {self.court_homography_path}: {e}. Recalibrating.")
-
-        
-        if not court_calibrated:
-            successful_detections = 0
-            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-
-            for frame_i in range(1, calib_frames + 1):
-                ret, frame = cap.read()
-                if not ret:
-                    break
-
-                if frame_i == 1:
-                    lines = self.court_detector.detect(frame)
-                else:
-                    lines = self.court_detector.track_court(frame)
-
-                if self.court_detector.success_flag and lines is not None:
-                    successful_detections += 1
-                    self.court_lines_frame_coords = lines
-                    self.court_warp_matrix = self.court_detector.court_warp_matrix[-1]
-                    self.game_warp_matrix = self.court_detector.game_warp_matrix[-1]
-
-                if self.enable_player_tracking and self.player_tracker:
-                    self.player_tracker.update(frame)
-
-
-                logger.info(f'Calibration Frame: {frame_i}/{calib_frames} (Court Successes: {successful_detections})')
-            
-            # Finalize court calibration result and save homography
-            if self.court_warp_matrix is not None:
-                logger.info("\nCourt calibration finalized. Saving homography.")
-                try:
-                    np.savez(self.court_homography_path, 
-                            court_warp_matrix=self.court_warp_matrix, 
-                            game_warp_matrix=self.game_warp_matrix,
-                            best_conf=self.court_detector.best_conf)
-                    logger.info(f"Final homography matrices saved to: {self.court_homography_path}")
-                except Exception as e:
-                    logger.error(f"Failed to save homography matrices: {e}")
-            else:
-                logger.error("\nCourt calibration failed on all frames.")
-                self.enable_court_tracking = False
-                self.enable_event_detection = False
-        
-        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-        self.frame_count = 0
-
-    
-    def build_court_minimap(self, width_minimap: int = 200, height_minimap: int = 120) -> np.ndarray:
-        """Build a small stylized court minimap image."""
-        court_reference = CourtReference()
-        court = court_reference.build_court_reference()
-        court = cv2.dilate(court, np.ones((10, 10), dtype=np.uint8))
-        court_img = (np.stack((court, court, court), axis=2) * 255).astype(np.uint8)
-        minimap = cv2.resize(court_img, (width_minimap, height_minimap))
-        return minimap
-
     def _update_player_tracking(self, frame: np.ndarray) -> None:
         """Update player tracking in parallel"""
         if self.enable_player_tracking and self.player_tracker:
@@ -285,6 +185,36 @@ class TennisAnalyzer:
         if self.enable_event_detection and self.event_detector and self.ball_tracker:
             self.event_detector.update()
 
+    def _calibrate_court(self, cap, total_frames):
+        """
+        Calibrate court detection from the first frame of a video.
+        
+        Args:
+            cap: OpenCV VideoCapture object
+            total_frames: Total number of frames in the video
+        """
+        if not self.enable_court_tracking or self.court_detector is None:
+            return
+        
+        # Save current position
+        current_pos = cap.get(cv2.CAP_PROP_POS_FRAMES)
+        
+        # Seek to first frame
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        ret, frame = cap.read()
+        
+        if ret:
+            logger.info("Calibrating court detection...")
+            # Use resized=True for faster detection during calibration
+            keypoints = self.court_detector.detect(frame, use_resized=True, verbose=1)
+            if keypoints is not None:
+                logger.info(f"Court calibrated with {len(keypoints)} keypoints")
+            else:
+                logger.warning("Court detection failed during calibration")
+        
+        # Reset to original position
+        cap.set(cv2.CAP_PROP_POS_FRAMES, current_pos)
+
     def _draw_annotations(self, frame: np.ndarray) -> np.ndarray:
         """Draw all tracking annotations on frame"""
         result_frame = frame
@@ -293,13 +223,9 @@ class TennisAnalyzer:
         if self.enable_ball_tracking and self.ball_tracker:
             result_frame = self.ball_tracker.draw_ball(result_frame)
             
-        # 2. Mark court lines (New Integration)
-        if self.enable_court_tracking and self.court_lines_frame_coords is not None:
-            lines = self.court_lines_frame_coords
-            for i in range(0, len(lines), 4):
-                x1, y1, x2, y2 = lines[i],lines[i+1], lines[i+2], lines[i+3]
-                cv2.line(result_frame, (int(x1),int(y1)),(int(x2),int(y2)), (0, 255, 255), 2)
-
+        # 2. Mark court lines
+        if self.enable_court_tracking and self.court_detector:
+            result_frame = self.court_detector.draw_court_overlay(result_frame)
         # 3. Mark players
         if self.enable_player_tracking and self.player_tracker:
             result_frame = self.player_tracker.draw_players(result_frame)
@@ -365,11 +291,8 @@ class TennisAnalyzer:
                 player_positions = self.player_tracker.get_player_positions()
             
             # Update court bounds if available
-            if self.court_lines_frame_coords is not None and self.scoreboard.court_bounds is None:
-                self.scoreboard.set_court_bounds(self.court_lines_frame_coords.reshape(-1, 2))
-            
-            # TODO
-            self.scoreboard.set_court_bounds(None)
+            if self.court_detector and self.court_detector.get_keypoints() is not None and self.scoreboard.court_bounds is None:
+                self.scoreboard.set_court_bounds(self.court_detector.get_keypoints())
 
             self.scoreboard.update(
                 ball_position=ball_pos,
@@ -383,109 +306,6 @@ class TennisAnalyzer:
 
         return result_frame
 
-    def _draw_minimap(self, frame: np.ndarray) -> np.ndarray:
-        """Draw court minimap on frame"""
-        result_frame = frame
-
-        # Draw court minimap with players and ball to the right side
-        frame_h, frame_w = result_frame.shape[0], result_frame.shape[1]
-        # minimap width as fraction of frame width
-        width_minimap = min(400, int(frame_w * 0.28))
-        height_minimap = frame_h
-
-        minimap = self.build_court_minimap(width_minimap, height_minimap)
-
-        player_positions = {}
-        if self.enable_player_tracking and self.player_tracker:
-            try:
-                player_positions = self.player_tracker.get_player_positions()
-            except Exception:
-                player_positions = {}
-
-        bounce_positions = {}
-        if self.enable_event_detection and self.event_detector:
-            try:
-                bounce_positions = self.event_detector.get_bounce_positions()
-            except Exception:
-                bounce_positions = {}
-
-        inv_mat = None
-        if self.game_warp_matrix is not None:
-            try:
-                inv_mat = np.linalg.inv(self.game_warp_matrix)
-            except Exception:
-                inv_mat = None
-
-        for pid, pos in player_positions.items():
-            point = np.array([[ [float(pos[0]), float(pos[1])] ]], dtype=np.float32)
-            mapped = None
-            if inv_mat is not None:
-                try:
-                    mapped = cv2.perspectiveTransform(point, inv_mat)
-                    mx = int(mapped[0, 0, 0])
-                    my = int(mapped[0, 0, 1])
-                    court_ref = CourtReference().build_court_reference()
-                    court_h, court_w = court_ref.shape
-                    if court_w > 0 and court_h > 0:
-                        scale_x = width_minimap / court_w
-                        scale_y = height_minimap / court_h
-                        draw_x = int(mx * scale_x)
-                        draw_y = int(my * scale_y)
-                    else:
-                        draw_x, draw_y = int(width_minimap * 0.5), int(height_minimap * 0.5)
-                except Exception:
-                    mapped = None
-
-            if inv_mat is None or mapped is None:
-                draw_x = int((pos[0] / max(1, frame_w)) * width_minimap)
-                draw_y = int((pos[1] / max(1, frame_h)) * height_minimap)
-
-            # choose color for player marker
-            color = (0, 0, 255) if pid == 1 else (255, 0, 0)
-            cv2.circle(minimap, (int(np.clip(draw_x, 0, width_minimap-1)), int(np.clip(draw_y, 0, height_minimap-1))),
-                        radius=8, color=color, thickness=-1)
-            cv2.putText(minimap, f'P{pid}', (int(np.clip(draw_x+10, 0, width_minimap-1)), int(np.clip(draw_y+10, 0, height_minimap-1))),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 1, cv2.LINE_AA)
-
-        for frame_idx, bounce_pos in bounce_positions.items():
-            # bounce_pos is in frame coords; map similar to players
-            point_b = np.array([[ [float(bounce_pos[0]), float(bounce_pos[1])] ]], dtype=np.float32)
-            mapped_b = None
-            if inv_mat is not None:
-                try:
-                    mapped_b = cv2.perspectiveTransform(point_b, inv_mat)
-                    bx = int(mapped_b[0, 0, 0])
-                    by = int(mapped_b[0, 0, 1])
-                    court_ref = CourtReference().build_court_reference()
-                    court_h, court_w = court_ref.shape
-                    if court_w > 0 and court_h > 0:
-                        scale_x = width_minimap / court_w
-                        scale_y = height_minimap / court_h
-                        draw_bx = int(bx * scale_x)
-                        draw_by = int(by * scale_y)
-                    else:
-                        draw_bx, draw_by = int(width_minimap * 0.5), int(height_minimap * 0.5)
-                except Exception:
-                    mapped_b = None
-
-            if inv_mat is None or mapped_b is None:
-                draw_bx = int((bounce_pos[0] / max(1, frame_w)) * width_minimap)
-                draw_by = int((bounce_pos[1] / max(1, frame_h)) * height_minimap)
-
-            cv2.circle(minimap, (int(np.clip(draw_bx, 0, width_minimap-1)), int(np.clip(draw_by, 0, height_minimap-1))),
-                        radius=10, color=(0, 255, 255), thickness=-1)
-
-        if minimap.shape[0] != frame_h:
-            minimap = cv2.resize(minimap, (width_minimap, frame_h))
-
-        combined_w = frame_w + minimap.shape[1]
-        combined_h = frame_h
-        combined = np.zeros((combined_h, combined_w, 3), dtype=result_frame.dtype)
-        combined[:, :frame_w] = result_frame
-        combined[:, frame_w:frame_w + minimap.shape[1]] = minimap
-
-        return combined
-    
     def _draw_info_overlay(self, frame: np.ndarray) -> np.ndarray:
         result_frame = frame
 
@@ -600,7 +420,7 @@ class TennisAnalyzer:
         if self.enable_player_tracking and self.player_tracker:
             self.player_tracker.calibration_max_frames = min(self.calib_frames, len(image_files))
 
-        
+    
         # Create a separate thread pool for frame analysis
         analysis_pool = ThreadPoolExecutor(max_workers=2)
         out_writer = None
@@ -633,12 +453,14 @@ class TennisAnalyzer:
                     except Exception:
                         logger.exception("Failed to create VideoWriter for image sequence")
                 
-                if self.enable_court_tracking and self.court_warp_matrix is None:
+                if self.enable_court_tracking and self.court_detector:
                     # Court detection for first frame only
-                    self.court_detector.detect(frame)
-                    self.court_lines_frame_coords = self.court_detector.lines
-                    self.court_warp_matrix = self.court_detector.court_warp_matrix[-1] if self.court_detector.court_warp_matrix else None
-                    self.game_warp_matrix = self.court_detector.game_warp_matrix[-1] if self.court_detector.game_warp_matrix else None
+                    logger.info("Calibrating court detection from first frame...")
+                    keypoints = self.court_detector.detect(frame, use_resized=True, verbose=1)
+                    if keypoints is not None:
+                        logger.info(f"Court calibrated with {len(keypoints)} keypoints")
+                    else:
+                        logger.warning("Court detection failed during calibration")
 
             # Submit frame for parallel processing
             future = analysis_pool.submit(process_frame, (i, image_path, frame))
