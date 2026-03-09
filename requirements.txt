@@ -12,3 +12,4 @@ matplotlib
 scikit-learn
 filterpy
 catboost
+h5py

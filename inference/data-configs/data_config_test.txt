@@ -1,6 +1,6 @@
 YOUTUBE_URL = "https://www.youtube.com/watch?v=zEu-xrXRhuk"
-VIDEO_OUTPUT_PATH = "data/web-scrapping/videofeed/tennis_game_test.mp4"
+VIDEO_OUTPUT_PATH = "data/web-scrapping/videofeed/near_out.mp4"
 FRAMES_DIR = "data/web-scrapping/frames_test"
-FRAME_START = 5000
-FRAME_END = 10000
+FRAME_START = 1
+FRAME_END = 5000
 #LIMIT_NUM_FRAMES = 3000

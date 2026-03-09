@@ -7,533 +7,593 @@ import glob
 from typing import Dict, List, Optional, Tuple
 import logging
 import time
-import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, Future
 import queue
 from collections import deque
 
+# Allow running from project root: `python inference_main.py`
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from inference.src.court_detector import CourtDetector
-
-from inference.src.player_tracker import PlayerTracker 
+from inference.src.net_detector import NetDetector
+from inference.src.player_tracker import PlayerTracker
 from inference.src.ball_tracker import BallTracker
 from inference.src.event_detection import EventDetector
 from inference.src.scoreboard import Scoreboard
+from inference.src.tennis_state_machine import Player
 
+# Root logger: ERROR by default so third-party libraries stay quiet.
+# Per-module loggers (set to INFO) are configured in _setup_file_logger().
 logging.basicConfig(level=logging.ERROR)
 logger = logging.getLogger(__name__)
 
 
+# ======================================================================
+#  TennisAnalyzer
+# ======================================================================
+
 class TennisAnalyzer:
-    def __init__(self, config_path: str = None):
-        """
-        Initialize tennis analyzer with all tracking components
+    """End-to-end tennis video / image-sequence analysis pipeline.
 
-        Args:
-            config_path: Path to configuration file
-        """
-        self.config = self._load_config(config_path) if config_path else {}
+    Component wiring
+    ----------------
+    CourtDetector   → supplies 16 keypoints to NetDetector, EventDetector,
+                      and Scoreboard (court_bounds / net_y).
+    NetDetector     → initialised from CourtDetector; called each frame
+                      by EventDetector._detect_net_hit().
+    BallTracker     → feeds ball_positions list to EventDetector.
+    PlayerTracker   → feeds active_players boxes to EventDetector
+                      (for player-area masking in NetDetector) and
+                      player_positions dict to Scoreboard.
+    EventDetector   → receives serve_context from Scoreboard.state_machine
+                      each frame; emits structured event dicts to Scoreboard.
+    Scoreboard      → drives TennisScoringStateMachine; renders overlay.
+    """
 
-        self.enable_ball_tracking = self.config.get("ENABLE_BALL_TRACKING", True)
+    # ------------------------------------------------------------------ #
+    #  Construction
+    # ------------------------------------------------------------------ #
+
+    def __init__(self, config_path: Optional[str] = None) -> None:
+        self.config: Dict = self._load_config(config_path) if config_path else {}
+
+        # ── Feature flags ──────────────────────────────────────────────
+        self.enable_ball_tracking   = self.config.get("ENABLE_BALL_TRACKING",   True)
         self.enable_player_tracking = self.config.get("ENABLE_PLAYER_TRACKING", True)
-        self.enable_court_tracking = self.config.get("ENABLE_COURT_TRACKING", True)
-        self.calib_frames = self.config.get("CALIB_FRAMES", 10)
-        
-        self.player_max_distance = self.config.get("PLAYER_MAX_DISTANCE", 25)
-        self.player_max_lost_frames = self.config.get("PLAYER_MAX_LOST_FRAMES", 10)
-        self.player_exp_pred = self.config.get("PLAYER_EXPONENTIAL_PREDICTION", 1.0)
-        self.player_model_path = self.config.get("PLAYER_MODEL_PATH", 'yolo11n.pt')
-        self.event_model_path = self.config.get("BOUNCE_MODEL_PATH")
-        self.enable_scoreboard = self.config.get("ENABLE_SCOREBOARD", True)
+        self.enable_court_tracking  = self.config.get("ENABLE_COURT_TRACKING",  True)
+        self.enable_scoreboard      = self.config.get("ENABLE_SCOREBOARD",      True)
 
-        self.enable_event_detection = self.enable_ball_tracking and self.enable_player_tracking and self.enable_court_tracking
+        # Event detection requires all three tracking subsystems
+        self.enable_event_detection = (
+            self.enable_ball_tracking
+            and self.enable_player_tracking
+            and self.enable_court_tracking
+        )
 
-        if self.enable_player_tracking:
-            self.player_tracker = PlayerTracker(
-                model_path=self.player_model_path,
-                max_distance=self.player_max_distance,
-                max_lost_frames=self.player_max_lost_frames,
-                exponential_prediction=self.player_exp_pred
+        # ── Per-component config ───────────────────────────────────────
+        self.calib_frames           = int(self.config.get("CALIB_FRAMES",                   10))
+        self.player_max_distance    = int(self.config.get("PLAYER_MAX_DISTANCE",            25))
+        self.player_max_lost_frames = int(self.config.get("PLAYER_MAX_LOST_FRAMES",         10))
+        self.player_exp_pred        = float(self.config.get("PLAYER_EXPONENTIAL_PREDICTION", 1.0))
+        self.player_model_path      = self.config.get("PLAYER_MODEL_PATH", "yolo11n.pt")
+        self.event_model_path       = self.config.get("BOUNCE_MODEL_PATH")
+
+        # ── Build components ───────────────────────────────────────────
+        self.player_tracker  = self._build_player_tracker()
+        self.ball_tracker    = self._build_ball_tracker()
+        self.court_detector  = CourtDetector(verbose=1) if self.enable_court_tracking else None
+
+        # NetDetector: only needed when event detection is active
+        self.net_detector: Optional[NetDetector] = None
+        if self.enable_event_detection:
+            self.net_detector = NetDetector(
+                fps=float(self.config.get("FPS", 30)),
+                verbose=0,
             )
-        else:
-            self.player_tracker = None
 
-        if self.enable_ball_tracking:
-            self.ball_tracker = BallTracker()
-            ball_model_weights = self.config.get("BALL_MODEL_WEIGHTS")
-            ball_model_name = self.config.get("BALL_MODEL_NAME", "TrackNetV4_TypeA")
-            if ball_model_weights:
-                ball_config = {
-                    "BALL_MODEL_WEIGHTS": ball_model_weights,
-                    "BALL_MODEL_NAME": ball_model_name
-                }
-                self.ball_tracker.update_config(ball_config)
-        else:
-            self.ball_tracker = None
-
-        if self.enable_court_tracking:
-            self.court_detector = CourtDetector(verbose=0)
-        else:
-            self.court_detector = None
-
+        # EventDetector: wires ball_tracker, court_detector, net_detector, player_tracker
+        self.event_detector: Optional[EventDetector] = None
         if self.enable_event_detection:
             self.event_detector = EventDetector(
-                self.ball_tracker, 
-                event_model_path=self.event_model_path
+                tracker=self.ball_tracker,
+                court_detector=self.court_detector,
+                net_detector=self.net_detector,
+                player_tracker=self.player_tracker,
+                event_model_path=self.event_model_path,
             )
-        else:
-            self.event_detector = None
 
+        # Scoreboard: frame dimensions updated after first frame is read
+        self.scoreboard: Optional[Scoreboard] = None
         if self.enable_scoreboard:
             self.scoreboard = Scoreboard(
-                frame_width=1280,
-                frame_height=720,
+                frame_width=int(self.config.get("FRAME_WIDTH", 1280)),
+                frame_height=int(self.config.get("FRAME_HEIGHT", 720)),
                 enable_auto_scoring=self.config.get("AUTO_SCORING", True),
-                rally_timeout_frames=self.config.get("RALLY_TIMEOUT_FRAMES", 50)
+                rally_timeout_frames=int(self.config.get("RALLY_TIMEOUT_FRAMES", 50)),
             )
-        else:
-            self.scoreboard = None
 
+        # ── Runtime state ──────────────────────────────────────────────
+        self.frame_count: int = 0
+        self.fps: float       = float(self.config.get("FPS", 30))
 
-        self.frame_count = 0
-        self.fps = self.config.get("FPS", 30)
-        self.prev_frame = None
-
-        # Output
-        self.show_display = self.config.get("SHOW_DISPLAY", True)
-        self.save_output = self.config.get("SAVE_OUTPUT", False)
-        self.output_path = self.config.get("OUTPUT_PATH", "/dev/null")
-        self.out_writer: Optional[cv2.VideoWriter] = None
+        # ── Output / display ───────────────────────────────────────────
+        self.show_display: bool = self.config.get("SHOW_DISPLAY", True)
+        self.save_output: bool  = self.config.get("SAVE_OUTPUT",  False)
+        self.output_path: str   = self.config.get("OUTPUT_PATH",  "output.mp4")
         self.output_dir: Optional[str] = None
+        self.out_writer: Optional[cv2.VideoWriter] = None
 
+        # Presentation ring-buffer
+        self.presentation_fps: int         = 24
+        self.presentation_results: deque   = deque()
+        self.frame_interval: float         = 1.0 / self.presentation_fps
+
+        # Thread pool – ball tracking runs in a background thread;
+        # player tracking (YOLO) must stay on the main thread.
         self.thread_pool = ThreadPoolExecutor(max_workers=3)
-        self.tracking_futures = {}
-        self.result_lock = threading.Lock()
-        
-        self.presentation_fps = 24
-        self.presentation_results = deque()
-        self.last_presentation_time = 0
-        self.frame_interval = 1.0 / self.presentation_fps
 
-    def _load_config(self, config_path: str) -> Dict:
-        """Load TennIQ configuration for inference from file"""
-        config = {}
+        # Internal flag: court + net calibrated at least once
+        self._court_calibrated: bool  = False
+        # Retry court calibration every N frames until it succeeds
+        self._court_calib_retry_every: int  = 30   # retry interval in frames
+        self._court_calib_last_attempt: int = 0    # frame_count of last attempt
+
+    # ------------------------------------------------------------------ #
+    #  Builder helpers
+    # ------------------------------------------------------------------ #
+
+    def _build_player_tracker(self) -> Optional[PlayerTracker]:
+        if not self.enable_player_tracking:
+            return None
+        return PlayerTracker(
+            model_path=self.player_model_path,
+            max_distance=self.player_max_distance,
+            max_lost_frames=self.player_max_lost_frames,
+            exponential_prediction=self.player_exp_pred,
+        )
+
+    def _build_ball_tracker(self) -> Optional[BallTracker]:
+        if not self.enable_ball_tracking:
+            return None
+        tracker = BallTracker()
+        ball_weights = self.config.get("BALL_MODEL_WEIGHTS")
+        if ball_weights:
+            ball_cfg: Dict = {
+                "BALL_MODEL_WEIGHTS": ball_weights,
+                "BALL_MODEL_NAME":    self.config.get("BALL_MODEL_NAME", "TrackNetV4_TypeA"),
+            }
+            catboost_path = self.config.get("BALL_FILL_PATH")
+            if catboost_path:
+                ball_cfg["CATBOOST_MODEL_PATH"] = catboost_path
+            tracker.update_config(ball_cfg)
+        return tracker
+
+    # ------------------------------------------------------------------ #
+    #  Config loader
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _load_config(config_path: str) -> Dict:
+        """Parse a simple KEY=VALUE config file."""
+        config: Dict = {}
+        if not os.path.exists(config_path):
+            logger.warning(f"Config file not found: {config_path}")
+            return config
         try:
-            if os.path.exists(config_path):
-                with open(config_path, "r") as f:
-                    for line in f:
-                        line = line.strip()
-                        if line and not line.startswith("#"):
-                            if "=" in line:
-                                key, value = line.split("=", 1)
-                                key = key.strip()
-                                value = value.strip().strip('"')
-
-                                # Convert boolean strings
-                                if value.lower() in ["true", "false"]:
-                                    config[key] = value.lower() == "true"
-                                # Convert numeric strings (allows float for exp_pred)
-                                elif value.replace(".", "").replace("-", "").isdigit():
-                                    if "." in value:
-                                        config[key] = float(value)
-                                    else:
-                                        config[key] = int(value)
-                                else:
-                                    config[key] = value
-
-                logger.info(f"Loaded config from {config_path}")
-            else:
-                logger.warning(f"Config file not found: {config_path}")
-        except Exception as e:
-            logger.error(f"Error loading config: {e}")
+            with open(config_path) as fh:
+                for raw_line in fh:
+                    line = raw_line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    key, _, value = line.partition("=")
+                    key   = key.strip()
+                    value = value.strip().strip('"').strip("'")
+                    if value.lower() in ("true", "false"):
+                        config[key] = value.lower() == "true"
+                    elif value.replace(".", "", 1).lstrip("-").isdigit():
+                        config[key] = float(value) if "." in value else int(value)
+                    else:
+                        config[key] = value
+            logger.info(f"Config loaded from {config_path}: {len(config)} keys")
+        except Exception:
+            logger.exception(f"Error reading config {config_path}")
         return config
 
-    def set_presentation_fps(self, fps: int):
-        self.presentation_fps = fps
-        self.frame_interval = 1.0 / fps
-        logger.info(f"Presentation FPS set to {fps}, frame interval: {self.frame_interval:.3f}s")
+    # ------------------------------------------------------------------ #
+    #  Presentation / output helpers
+    # ------------------------------------------------------------------ #
 
-    def presentation(self):
-        if self.presentation_results:
-            result_frame = self.presentation_results[-1]
-            if self.out_writer is not None:
-                try:
-                    self.out_writer.write(result_frame)
-                except Exception:
-                    logger.exception("Failed to write frame to output writer")
-                    return False
-            max_results = self.presentation_fps * 2
-            while len(self.presentation_results) > max_results:
-                self.presentation_results.popleft()
+    def set_presentation_fps(self, fps: int) -> None:
+        self.presentation_fps  = max(1, fps)
+        self.frame_interval    = 1.0 / self.presentation_fps
+
+    def presentation(self) -> bool:
+        """Flush the latest result frame to the VideoWriter. Returns False on error."""
+        if not self.presentation_results:
+            return True
+        frame = self.presentation_results[-1]
+        if self.out_writer is not None:
+            try:
+                self.out_writer.write(frame)
+            except Exception:
+                logger.exception("VideoWriter.write() failed")
+                return False
+        # Keep at most ~2 s of frames in the ring-buffer
+        max_buf = self.presentation_fps * 2
+        while len(self.presentation_results) > max_buf:
+            self.presentation_results.popleft()
         return True
 
-    def _update_player_tracking(self, frame: np.ndarray) -> None:
-        """Update player tracking in parallel"""
-        if self.enable_player_tracking and self.player_tracker:
-            # start_time = time.time()
-            # print(time.time() - start_time)
-            self.player_tracker.update(frame)
+    def _init_writer(self, width: int, height: int) -> None:
+        if not self.save_output or self.out_writer is not None:
+            return
+        try:
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            self.out_writer = cv2.VideoWriter(
+                self.output_path, fourcc, self.fps, (width, height)
+            )
+            if not self.out_writer.isOpened():
+                logger.error(f"VideoWriter failed to open: {self.output_path}")
+                self.out_writer = None
+        except Exception:
+            logger.exception("Failed to create VideoWriter")
 
-    def _update_ball_tracking(self, frames: List[np.ndarray]) -> None:
-        """Update ball tracking in parallel"""
-        if self.enable_ball_tracking and self.ball_tracker:
-            self.ball_tracker.update(frames)
+    def _release_writer(self) -> None:
+        if self.out_writer is not None:
+            try:
+                self.out_writer.release()
+            except Exception:
+                logger.exception("Failed to release VideoWriter")
+            self.out_writer = None
 
-    def _update_event_detection(self) -> None:
-        """Update event detection in parallel"""
-        if self.enable_event_detection and self.event_detector and self.ball_tracker:
-            self.event_detector.update()
+    # ------------------------------------------------------------------ #
+    #  Court + net calibration
+    # ------------------------------------------------------------------ #
 
-    def _calibrate_court(self, cap, total_frames):
+    def _calibrate_court_from_frame(self, frame: np.ndarray) -> bool:
         """
-        Calibrate court detection from the first frame of a video.
-        
-        Args:
-            cap: OpenCV VideoCapture object
-            total_frames: Total number of frames in the video
+        Run court + net calibration on *frame* and propagate keypoints to
+        all downstream components.
+
+        Returns True if calibration succeeded, False otherwise.
+        Called once at startup and retried every _court_calib_retry_every
+        frames until it succeeds.
         """
+        if self.court_detector is None:
+            return False
+
+        logger.info("CourtDetector: attempting calibration…")
+        keypoints = self.court_detector.detect(frame, use_resized=True, verbose=1)
+
+        if keypoints is None:
+            logger.warning(
+                "Court calibration FAILED on this frame — will retry in "
+                f"{self._court_calib_retry_every} frames."
+            )
+            # Still initialise NetDetector with a heuristic fallback so the
+            # pipeline does not crash while waiting for a successful calibration.
+            if self.net_detector is not None and not self.net_detector._initialized:
+                self.net_detector.initialize_from_frame(frame, court_detector=None)
+                logger.info("NetDetector: fallback initialisation (no court keypoints).")
+            return False
+
+        logger.info(f"Court calibration SUCCESS — {len(keypoints)} keypoints detected.")
+
+        # ── Scoreboard: update frame dimensions + court bounds ─────────
+        if self.scoreboard is not None:
+            h, w = frame.shape[:2]
+            self.scoreboard.frame_width  = w
+            self.scoreboard.frame_height = h
+            self.scoreboard.set_court_bounds(keypoints)
+            logger.info(
+                f"Scoreboard: court bounds updated "
+                f"(frame {w}×{h}, net_y={self.scoreboard.state_machine.NET_Y})."
+            )
+
+        # ── NetDetector: reinitialise from real court keypoints ─────────
+        if self.net_detector is not None:
+            self.net_detector.initialize_from_frame(frame, self.court_detector)
+            logger.info(
+                f"NetDetector: initialised from court keypoints "
+                f"(net_region={self.net_detector.net_region})."
+            )
+
+        # ── EventDetector: invalidate lazy geometry cache ──────────────
+        if self.event_detector is not None:
+            self.event_detector._court_polygon = None
+            self.event_detector._service_boxes = {}
+            self.event_detector._net_y         = None
+            self.event_detector._ensure_court_geometry()
+            logger.info(
+                f"EventDetector: court geometry rebuilt "
+                f"(court_polygon={'set' if self.event_detector._court_polygon is not None else 'None'}, "
+                f"service_boxes={list(self.event_detector._service_boxes.keys())})."
+            )
+
+        self._court_calibrated = True
+        return True
+
+    def _calibrate_court_from_video(self, cap: cv2.VideoCapture) -> None:
+        """Seek to frame 0, attempt calibration, then restore position."""
         if not self.enable_court_tracking or self.court_detector is None:
             return
-        
-        # Save current position
-        current_pos = cap.get(cv2.CAP_PROP_POS_FRAMES)
-        
-        # Seek to first frame
+        saved_pos = cap.get(cv2.CAP_PROP_POS_FRAMES)
         cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
         ret, frame = cap.read()
-        
         if ret:
-            logger.info("Calibrating court detection...")
-            # Use resized=True for faster detection during calibration
-            keypoints = self.court_detector.detect(frame, use_resized=True, verbose=1)
-            if keypoints is not None:
-                logger.info(f"Court calibrated with {len(keypoints)} keypoints")
-            else:
-                logger.warning("Court detection failed during calibration")
-        
-        # Reset to original position
-        cap.set(cv2.CAP_PROP_POS_FRAMES, current_pos)
+            self._calibrate_court_from_frame(frame)
+        else:
+            logger.warning("CourtDetector: could not read first frame for calibration.")
+        cap.set(cv2.CAP_PROP_POS_FRAMES, saved_pos)
 
-    def _draw_annotations(self, frame: np.ndarray) -> np.ndarray:
-        """Draw all tracking annotations on frame"""
-        result_frame = frame
-
-        # 1. Mark ball position
-        if self.enable_ball_tracking and self.ball_tracker:
-            result_frame = self.ball_tracker.draw_ball(result_frame)
-            
-        # 2. Mark court lines
-        if self.enable_court_tracking and self.court_detector:
-            result_frame = self.court_detector.draw_court_overlay(result_frame)
-        # 3. Mark players
-        if self.enable_player_tracking and self.player_tracker:
-            result_frame = self.player_tracker.draw_players(result_frame)
-
-        # 4. Mark events
-        if self.enable_event_detection and self.event_detector:
-            result_frame = self.event_detector.draw_events(result_frame)
-        
-        # 5. Draw scoreboard
-        if self.enable_scoreboard and self.scoreboard:
-            player_positions = None
-            if self.enable_player_tracking and self.player_tracker:
-                player_positions = self.player_tracker.get_player_positions()
-            result_frame = self.scoreboard.draw_scoreboard(result_frame, player_positions)
-
-        return result_frame
-
-
+    # ------------------------------------------------------------------ #
+    #  Per-frame analysis
+    # ------------------------------------------------------------------ #
 
     def _analyze_frame(self, frame: np.ndarray) -> np.ndarray:
         """
-        Analyze single frame with all tracking components in parallel
+        Run all enabled trackers on *frame* and return the annotated frame.
 
-        Args:
-            frame: Input video frame
-
-        Returns:
-            Annotated frame with analysis results
+        Execution order matters:
+          1. PlayerTracker.update()        – synchronous (YOLO not thread-safe)
+          2. BallTracker.update()          – dispatched to thread pool
+          3. EventDetector.update()        – needs ball history + player boxes;
+                                             runs after ball future resolves
+          4. Scoreboard.update()           – consumes event list
+          5. _draw_annotations()           – pure rendering
         """
-        frame_id = self.frame_count
-        futures = []
-        
-        # Player tracking
-        if self.enable_player_tracking:
-            # player_future = self.thread_pool.submit(self._update_player_tracking, frame)
-            # futures.append(player_future)
-            self.player_tracker.update(frame)
-        # Ball tracking
-        if self.enable_ball_tracking:
-            ball_future = self.thread_pool.submit(self._update_ball_tracking, frame)
-            futures.append(ball_future)
-        
-        # Event detection
-        new_events = []
-        if self.enable_event_detection:
-            # event_future = self.thread_pool.submit(self._update_event_detection)
-            # futures.append(event_future)
-            new_events = self.event_detector.update()
-        
-        for future in futures:
-            future.result()
-        
-        # Update scoreboard
-        if self.enable_scoreboard and self.scoreboard:
-            ball_pos = None
-            if self.enable_ball_tracking and self.ball_tracker:
-                ball_history = self.ball_tracker.get_ball_history()
-                if ball_history:
-                    ball_pos = ball_history[-1]
-            
-            player_positions = None
-            if self.enable_player_tracking and self.player_tracker:
-                player_positions = self.player_tracker.get_player_positions()
-            
-            # Update court bounds if available
-            if self.court_detector and self.court_detector.get_keypoints() is not None and self.scoreboard.court_bounds is None:
-                self.scoreboard.set_court_bounds(self.court_detector.get_keypoints())
+        ball_future: Optional[Future] = None
 
+        # ── Retry court calibration until it succeeds ──────────────────
+        # The C++ detector may fail on the first frame (motion blur, bad
+        # lighting) but succeed on a later frame.  We keep retrying every
+        # _court_calib_retry_every frames so the pipeline self-heals.
+        if (
+            self.enable_court_tracking
+            and not self._court_calibrated
+            and self.court_detector is not None
+            and (self.frame_count - self._court_calib_last_attempt)
+                >= self._court_calib_retry_every
+        ):
+            self._court_calib_last_attempt = self.frame_count
+            self._calibrate_court_from_frame(frame)
+
+        # 1. Player tracking (must be synchronous)
+        if self.enable_player_tracking and self.player_tracker is not None:
+            self.player_tracker.update(frame)
+
+        # 2. Ball tracking (background)
+        if self.enable_ball_tracking and self.ball_tracker is not None:
+            ball_future = self.thread_pool.submit(self.ball_tracker.update, frame)
+
+        # 3. Wait for ball tracking before running event detection
+        if ball_future is not None:
+            try:
+                ball_future.result()
+            except Exception:
+                logger.exception("BallTracker.update() raised an exception")
+
+        # 4. Event detection
+        new_events: List[Dict] = []
+        if self.enable_event_detection and self.event_detector is not None:
+            # Inject current serve context so SERVE_FAULT can be classified
+            if self.scoreboard is not None:
+                try:
+                    serve_ctx = self.scoreboard.state_machine.get_serve_context()
+                    self.event_detector.set_serve_context(serve_ctx)
+                except Exception:
+                    logger.exception("Failed to get serve context from state machine")
+
+            try:
+                new_events = self.event_detector.update(frame)
+            except Exception:
+                logger.exception("EventDetector.update() raised an exception")
+
+        # 5. Scoreboard update
+        self._update_scoreboard(new_events, frame)
+
+        # 6. Draw all annotations
+        result_frame = self._draw_annotations(frame)
+
+        return result_frame
+
+    def _update_scoreboard(self, new_events: List[Dict], frame: np.ndarray) -> None:
+        """Push latest tracking data and events into the scoreboard."""
+        if not self.enable_scoreboard or self.scoreboard is None:
+            return
+
+        # Ball position: last element of ball_positions list
+        ball_pos: Optional[Tuple] = None
+        if self.enable_ball_tracking and self.ball_tracker is not None:
+            history = self.ball_tracker.get_ball_history()
+            if history:
+                raw = history[-1]
+                # Positions may be 2-tuple or 3-tuple (x, y[, flag])
+                ball_pos = (raw[0], raw[1]) if raw else None
+
+        # Player positions: {1: (x,y), 2: (x,y)}
+        player_positions: Optional[Dict] = None
+        if self.enable_player_tracking and self.player_tracker is not None:
+            player_positions = self.player_tracker.get_player_positions()
+
+        # One-shot: push court bounds to scoreboard once court is calibrated
+        if (
+            self._court_calibrated
+            and self.court_detector is not None
+            and self.scoreboard.court_bounds is None
+        ):
+            kp = self.court_detector.get_keypoints()
+            if kp is not None:
+                self.scoreboard.set_court_bounds(kp)
+
+        try:
             self.scoreboard.update(
                 ball_position=ball_pos,
                 player_positions=player_positions,
-                events=new_events
+                events=new_events,
             )
-        
-        result_frame = self._draw_annotations(frame)
+        except Exception:
+            logger.exception("Scoreboard.update() raised an exception")
 
-        result_frame = self._draw_info_overlay(result_frame)
+    # ------------------------------------------------------------------ #
+    #  Annotation rendering
+    # ------------------------------------------------------------------ #
 
-        return result_frame
+    def _draw_annotations(self, frame: np.ndarray) -> np.ndarray:
+        """Compose all visual overlays onto a copy of *frame*."""
+        result = frame.copy()
 
-    def _draw_info_overlay(self, frame: np.ndarray) -> np.ndarray:
-        result_frame = frame
+        # Ball trail
+        if self.enable_ball_tracking and self.ball_tracker is not None:
+            try:
+                result = self.ball_tracker.draw_ball(result)
+            except Exception:
+                logger.exception("BallTracker.draw_ball() failed")
 
-        # Info panel background
-        overlay = result_frame
-        cv2.rectangle(overlay, (10, 10), (400, 180), (0, 0, 0), -1)
-        cv2.addWeighted(overlay, 0.7, result_frame, 0.3, 0, result_frame)
+        # Court lines
+        if self.enable_court_tracking and self.court_detector is not None:
+            try:
+                result = self.court_detector.draw_court_overlay(result)
+            except Exception:
+                logger.exception("CourtDetector.draw_court_overlay() failed")
 
-        # Frame info
-        y_offset = 30
-        cv2.putText(
-            result_frame,
-            f"Frame: {self.frame_count}",
-            (20, y_offset),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (255, 255, 255),
-            1,
-        )
+        # Player boxes + trails
+        if self.enable_player_tracking and self.player_tracker is not None:
+            try:
+                result = self.player_tracker.draw_players(result)
+            except Exception:
+                logger.exception("PlayerTracker.draw_players() failed")
 
-        y_offset += 25
-        status_color = (0, 255, 0) if self.enable_ball_tracking else (128, 128, 128)
-        cv2.putText(
-            result_frame,
-            f"Ball Tracking: {'ON' if self.enable_ball_tracking else 'OFF'}",
-            (20, y_offset),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            status_color,
-            1,
-        )
+        # Event markers (HIT / BOUNCE / OUT / NET / SERVE_FAULT)
+        if self.enable_event_detection and self.event_detector is not None:
+            try:
+                result = self.event_detector.draw_events(result)
+            except Exception:
+                logger.exception("EventDetector.draw_events() failed")
 
-        y_offset += 20
-        status_color = (0, 255, 0) if self.enable_player_tracking else (128, 128, 128)
-        cv2.putText(
-            result_frame,
-            f"Player Tracking: {'ON' if self.enable_player_tracking else 'OFF'}",
-            (20, y_offset),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            status_color,
-            1,
-        )
+        # Scoreboard overlay + debug panel
+        if self.enable_scoreboard and self.scoreboard is not None:
+            try:
+                player_pos = (
+                    self.player_tracker.get_player_positions()
+                    if self.enable_player_tracking and self.player_tracker
+                    else None
+                )
+                result = self.scoreboard.draw_scoreboard(result, player_pos)
+                feature_flags = {
+                    "Ball Tracking":   self.enable_ball_tracking,
+                    "Player Tracking": self.enable_player_tracking,
+                    "Court Tracking":  self.enable_court_tracking,
+                    "Event Detection": self.enable_event_detection,
+                }
+                result = self.scoreboard.draw_debug_overlay(
+                    result, self.frame_count, feature_flags
+                )
+            except Exception:
+                logger.exception("Scoreboard rendering failed")
 
-        y_offset += 20
-        status_color = (0, 255, 0) if self.enable_court_tracking else (128, 128, 128)
-        cv2.putText(
-            result_frame,
-            f"Court Tracking: {'ON' if self.enable_court_tracking else 'OFF'}",
-            (20, y_offset),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            status_color,
-            1,
-        )
+        return result
 
-        y_offset += 20
-        status_color = (0, 255, 0) if self.enable_event_detection else (128, 128, 128)
-        cv2.putText(
-            result_frame,
-            f"Event Detection: {'ON' if self.enable_event_detection else 'OFF'}",
-            (20, y_offset),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            status_color,
-            1,
-        )
-        return result_frame
-    
-    def _print_analysis_summary(self):
-        print("\n" + "=" * 50)
-        print("TENNIS ANALYSIS SUMMARY")
-        print("=" * 50)
-        print(f"Total frames analyzed: {self.frame_count}")
-        print(f"Ball tracking: {self.enable_ball_tracking}")
-        print(f"Player tracking: {self.enable_player_tracking}")
-        print(f"Court tracking: {self.enable_court_tracking}")
-        print(f"Event detection: {self.enable_event_detection}")
+    # ------------------------------------------------------------------ #
+    #  Keyboard handler (video mode)
+    # ------------------------------------------------------------------ #
+
+    def _handle_key(self, key: int) -> bool:
+        """Handle a key press; returns True when user requests quit."""
+        if key == ord("q"):
+            return True
+        if self.scoreboard is None:
+            return False
+        if key == ord("1"):
+            self.scoreboard.manual_award_point(Player.UPPER)
+        elif key == ord("2"):
+            self.scoreboard.manual_award_point(Player.LOWER)
+        elif key == ord("r"):
+            self.scoreboard.reset_score()
+        elif key == ord("h"):
+            print(
+                "\nKeyboard controls:\n"
+                "  1 – award point to Player 1 (rear/upper)\n"
+                "  2 – award point to Player 2 (front/lower)\n"
+                "  r – reset score\n"
+                "  q – quit\n"
+            )
+        return False
+
+    # ------------------------------------------------------------------ #
+    #  Summary
+    # ------------------------------------------------------------------ #
+
+    def _print_analysis_summary(self) -> None:
+        sep = "=" * 52
+        lines = [
+            "",
+            sep,
+            "  TENNIS ANALYSIS SUMMARY",
+            sep,
+            f"  Frames analysed : {self.frame_count}",
+            f"  Ball tracking   : {'ON' if self.enable_ball_tracking   else 'OFF'}",
+            f"  Player tracking : {'ON' if self.enable_player_tracking else 'OFF'}",
+            f"  Court tracking  : {'ON' if self.enable_court_tracking  else 'OFF'}",
+            f"  Event detection : {'ON' if self.enable_event_detection else 'OFF'}",
+            f"  Scoreboard      : {'ON' if self.enable_scoreboard      else 'OFF'}",
+        ]
 
         if self.enable_court_tracking and self.court_detector:
-            print("Court tracking done and calibrated.")
+            status = "calibrated" if self._court_calibrated else "NOT calibrated"
+            lines.append(f"  Court detector  : {status}")
 
         if self.enable_player_tracking and self.player_tracker:
-            print(f"Player tracking done (Calibration: {'Completed' if self.player_tracker.calibration_done else 'Running'})")
-
-        if self.enable_ball_tracking and self.ball_tracker:
-            print(f"Ball tracking done")
+            calib = "done" if self.player_tracker.calibration_done else "incomplete"
+            lines.append(f"  Player calib    : {calib}")
 
         if self.enable_event_detection and self.event_detector:
-            print(f"Event detection done")
+            total_events = sum(
+                len(v) for v in self.event_detector.get_events().values()
+            )
+            lines.append(f"  Events detected : {total_events}")
 
-        print("=" * 50)
+        lines.append(sep)
+        print("\n".join(lines))
 
-    def analyze_image_sequence(self, image_dir: str) -> None:
-        if not os.path.exists(image_dir):
-            logger.error(f"Image directory not found: {image_dir}")
-            return
-            
-        # Get image files
-        image_files = []
-        for ext in ["*.jpg", "*.jpeg", "*.png"]:
-            image_files.extend(glob.glob(os.path.join(image_dir, ext)))
-
-        image_files.sort()
-
-        if not image_files:
-            logger.error(f"No image files found in {image_dir}")
-            return
-
-        logger.info(f"Found {len(image_files)} images in {image_dir}")
-
-        if self.enable_player_tracking and self.player_tracker:
-            self.player_tracker.calibration_max_frames = min(self.calib_frames, len(image_files))
-
-    
-        # Create a separate thread pool for frame analysis
-        analysis_pool = ThreadPoolExecutor(max_workers=2)
-        out_writer = None
-        frame_queue = queue.Queue()
-        start_time = time.time()
-        submitted_frames = 0
-        processed_frames = 0
-        processed_frames_1 = 0
-        fps_avg = 0.0
-        
-        def process_frame(frame_data):
-            i, image_path, frame = frame_data
-            result_frame = self._analyze_frame(frame)
-            return i, result_frame
-
-        for i, image_path in enumerate(image_files):
-            frame = cv2.imread(image_path)
-            if frame is None:
-                continue
-            
-            # first frame
-            if i == 0:
-                # initialize writer on first available frame
-                if self.save_output and self.output_path and self.out_writer is None:
-                    try:
-                        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                        # result_frame shape is (H,W,3)
-                        out_writer = cv2.VideoWriter(self.output_path, fourcc, self.fps, (frame.shape[1], frame.shape[0]))
-                        self.out_writer = out_writer
-                    except Exception:
-                        logger.exception("Failed to create VideoWriter for image sequence")
-                
-                if self.enable_court_tracking and self.court_detector:
-                    # Court detection for first frame only
-                    logger.info("Calibrating court detection from first frame...")
-                    keypoints = self.court_detector.detect(frame, use_resized=True, verbose=1)
-                    if keypoints is not None:
-                        logger.info(f"Court calibrated with {len(keypoints)} keypoints")
-                    else:
-                        logger.warning("Court detection failed during calibration")
-
-            # Submit frame for parallel processing
-            future = analysis_pool.submit(process_frame, (i, image_path, frame))
-            frame_queue.put((i, future))
-            submitted_frames += 1
-
-            if frame_queue.qsize() >= 5:
-                frame_idx, future = frame_queue.get()
-                _, result_frame = future.result()
-                self.presentation_results.append(result_frame)
-                self.frame_count = frame_idx + 1
-                processed_frames += 1
-                
-                progress = (processed_frames / len(image_files)) * 100
-
-                if(time.time() - start_time >= .99):
-                    start_time = time.time()
-                    fps_avg = processed_frames - processed_frames_1
-                    processed_frames_1 = processed_frames
-                print(f"Progress: {progress:.1f}% ({processed_frames}/{len(image_files)}), Avg FPS: {fps_avg:.1f}", end="\r")
-
-                if not self.presentation():
-                    break
-
-        analysis_pool.shutdown()
-
-        # release writer
-        if self.out_writer is not None:
-            self.out_writer.release()
-
-        if self.show_display:
-            cv2.destroyAllWindows()
-
-        self._print_analysis_summary()
+    # ------------------------------------------------------------------ #
+    #  Video analysis
+    # ------------------------------------------------------------------ #
 
     def analyze_video(self, video_path: str) -> None:
-        """
-        Analyze tennis video with comprehensive tracking
-
-        Args:
-            video_path: Path to input video file
-        """
+        """Process a video file frame-by-frame."""
         if not os.path.exists(video_path):
             logger.error(f"Video file not found: {video_path}")
             return
 
-        # VideoCapture
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
-            logger.error(f"Failed to open video: {video_path}")
+            logger.error(f"Cannot open video: {video_path}")
             return
 
-        self.fps = cap.get(cv2.CAP_PROP_FPS)
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        # Read video metadata
+        self.fps        = cap.get(cv2.CAP_PROP_FPS) or self.fps
+        total_frames    = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        frame_width     = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        frame_height    = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
         logger.info(
-            f"Video: {frame_width}x{frame_height}, {self.fps} FPS, {total_frames} frames"
+            f"Video opened: {frame_width}×{frame_height} @ {self.fps:.1f} FPS, "
+            f"{total_frames} frames"
         )
-        
-        self._calibrate_court(cap, total_frames)
 
-        # prepare output writer if requested
-        if self.save_output and self.output_path:
-            try:
-                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                self.out_writer = cv2.VideoWriter(self.output_path, fourcc, self.fps, (frame_width, frame_height))
-            except Exception:
-                logger.exception("Failed to create VideoWriter for video output")
+        # Set player tracker calibration window
+        if self.player_tracker is not None:
+            self.player_tracker.calibration_max_frames = max(
+                self.calib_frames,
+                int(self.fps * 2),   # at least 2 seconds
+            )
+
+        # Court calibration from first frame
+        self._calibrate_court_from_video(cap)
+        self._init_writer(frame_width, frame_height)
 
         start_time = time.time()
-
         try:
             while True:
                 ret, frame = cap.read()
@@ -541,133 +601,235 @@ class TennisAnalyzer:
                     break
 
                 self.frame_count += 1
-                
                 result_frame = self._analyze_frame(frame)
-                
-                # Add result to presentation queue
                 self.presentation_results.append(result_frame)
 
-                # Present at specified FPS
                 if not self.presentation():
                     break
 
-                # Display frame if enabled
                 if self.show_display:
                     cv2.imshow("TennIQ Analysis", result_frame)
-                    
-                    # Handle keyboard input for manual scoring
                     key = cv2.waitKey(1) & 0xFF
-                    if key == ord('q'):
-                        logger.info("Quit requested by user")
+                    if self._handle_key(key):
                         break
-                    elif key == ord('1') and self.scoreboard:
-                        # Award point to upper player (rear)
-                        from inference.src.scoreboard import Player
-                        self.scoreboard.manual_award_point(Player.UPPER)
-                    elif key == ord('2') and self.scoreboard:
-                        # Award point to lower player (front)
-                        from inference.src.scoreboard import Player
-                        self.scoreboard.manual_award_point(Player.LOWER)
-                    elif key == ord('r') and self.scoreboard:
-                        # Reset score
-                        self.scoreboard.reset_score()
-                    elif key == ord('h'):
-                        # Show help
-                        logger.info("Keyboard controls: 1=Point to P1(rear), 2=Point to P2(front), r=Reset score, q=Quit")
 
-                if self.out_writer:
-                    self.out_writer.write(result_frame)
-
-                progress = (self.frame_count / total_frames) * 100
-                elapsed = time.time() - start_time
-                fps_avg = self.frame_count / elapsed
-                logger.info(
-                    f"Progress: {progress:.1f}% ({self.frame_count}/{total_frames}), "
-                    f"Avg FPS: {fps_avg:.1f}"
-                )
-
-                self.prev_frame = frame
+                # Progress log every 30 frames
+                if self.frame_count % 30 == 0 and total_frames > 0:
+                    pct     = self.frame_count / total_frames * 100
+                    elapsed = time.time() - start_time
+                    fps_avg = self.frame_count / elapsed if elapsed > 0 else 0
+                    print(
+                        f"\rProgress: {pct:5.1f}%  "
+                        f"({self.frame_count}/{total_frames})  "
+                        f"avg {fps_avg:.1f} fps",
+                        end="",
+                        flush=True,
+                    )
 
         except KeyboardInterrupt:
-            logger.info("Analysis interrupted by user")
-
+            logger.info("Interrupted by user.")
         finally:
+            print()
             cap.release()
-            if self.out_writer:
-                try:
-                    self.out_writer.release()
-                except Exception:
-                    logger.exception("Failed to release out_writer")
+            self._release_writer()
             if self.show_display:
                 cv2.destroyAllWindows()
-
             total_time = time.time() - start_time
             avg_fps = self.frame_count / total_time if total_time > 0 else 0
             logger.info(
-                f"Analysis completed: {self.frame_count} frames in {total_time:.1f}s "
-                f"(avg {avg_fps:.1f} FPS)"
+                f"Finished: {self.frame_count} frames in "
+                f"{total_time:.1f}s ({avg_fps:.1f} fps avg)"
             )
-
             self._print_analysis_summary()
 
+    # ------------------------------------------------------------------ #
+    #  Image-sequence analysis
+    # ------------------------------------------------------------------ #
 
-def main():
-    parser = argparse.ArgumentParser(description="TennIQ Tennis Analysis System")
+    def analyze_image_sequence(self, image_dir: str) -> None:
+        """Process a directory of images in sorted order."""
+        if not os.path.exists(image_dir):
+            logger.error(f"Image directory not found: {image_dir}")
+            return
+
+        image_files: List[str] = sorted(
+            path
+            for ext in ("*.jpg", "*.jpeg", "*.png", "*.bmp")
+            for path in glob.glob(os.path.join(image_dir, ext))
+        )
+        if not image_files:
+            logger.error(f"No images found in {image_dir}")
+            return
+
+        total = len(image_files)
+        logger.info(f"Image sequence: {total} files in {image_dir}")
+
+        if self.player_tracker is not None:
+            self.player_tracker.calibration_max_frames = min(self.calib_frames, total)
+
+        # Limit queue depth to avoid excessive memory use
+        QUEUE_DEPTH = 4
+        analysis_pool  = ThreadPoolExecutor(max_workers=2)
+        frame_queue: queue.Queue = queue.Queue()
+        start_time      = time.time()
+        processed       = 0
+
+        def _process(idx_frame: Tuple[int, np.ndarray]) -> Tuple[int, np.ndarray]:
+            idx, frm = idx_frame
+            return idx, self._analyze_frame(frm)
+
+        try:
+            for i, path in enumerate(image_files):
+                frame = cv2.imread(path)
+                if frame is None:
+                    logger.warning(f"Could not read image: {path}")
+                    continue
+
+                # First-frame initialisation
+                if i == 0:
+                    self._init_writer(frame.shape[1], frame.shape[0])
+                    if self.enable_court_tracking:
+                        self._calibrate_court_from_frame(frame)
+
+                future = analysis_pool.submit(_process, (i, frame))
+                frame_queue.put((i, future))
+
+                # Drain the queue when it reaches the depth limit
+                while frame_queue.qsize() >= QUEUE_DEPTH:
+                    _, fut = frame_queue.get()
+                    try:
+                        _, result_frame = fut.result()
+                    except Exception:
+                        logger.exception("Frame processing failed")
+                        continue
+                    self.presentation_results.append(result_frame)
+                    self.frame_count += 1
+                    processed += 1
+                    self.presentation()
+
+                    elapsed = time.time() - start_time
+                    fps_avg = processed / elapsed if elapsed > 0 else 0
+                    print(
+                        f"\rProgress: {processed/total*100:5.1f}%  "
+                        f"({processed}/{total})  "
+                        f"avg {fps_avg:.1f} fps",
+                        end="",
+                        flush=True,
+                    )
+
+            # Drain remaining futures
+            while not frame_queue.empty():
+                _, fut = frame_queue.get()
+                try:
+                    _, result_frame = fut.result()
+                except Exception:
+                    logger.exception("Frame processing failed (drain)")
+                    continue
+                self.presentation_results.append(result_frame)
+                self.frame_count += 1
+                processed += 1
+                self.presentation()
+
+        finally:
+            analysis_pool.shutdown(wait=True)
+            self._release_writer()
+            if self.show_display:
+                cv2.destroyAllWindows()
+
+        print()
+        self._print_analysis_summary()
+
+
+# ======================================================================
+#  Logging helper
+# ======================================================================
+
+def _setup_file_logger(log_path: str) -> None:
+    """Attach a file handler at INFO level to the root logger."""
+    os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
+    fh = logging.FileHandler(log_path)
+    fh.setLevel(logging.INFO)
+    fh.setFormatter(
+        logging.Formatter("%(asctime)s  %(name)-30s  %(levelname)-8s  %(message)s")
+    )
+    root = logging.getLogger()
+    root.addHandler(fh)
+    root.setLevel(logging.INFO)
+
+
+# ======================================================================
+#  CLI entry point
+# ======================================================================
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="TennIQ – Tennis Video Analysis System",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
     parser.add_argument(
-        "--config",
-        "-c",
+        "--config", "-c",
         default="inference/data-configs/data_config_alcaraz.txt",
-        help="Path to configuration file",
+        help="Path to KEY=VALUE configuration file",
     )
     parser.add_argument(
-        "--input", "-i", required=True, help="Input video file or image directory path"
+        "--input", "-i",
+        required=True,
+        help="Input: path to a video file, or a directory containing images",
     )
-    parser.add_argument("--output", "-o", help="Optional output video file path (overrides config)")
-    parser.add_argument("--no-display", action="store_true", help="Disable display window")
+    parser.add_argument(
+        "--output", "-o",
+        default=None,
+        help="Override output video path (default: outputs/<timestamp>/inference.mp4)",
+    )
     parser.add_argument(
         "--mode",
         choices=["video", "images"],
         default="video",
-        help="Analysis mode: video file or image sequence",
+        help="Input mode: 'video' for a video file, 'images' for an image directory",
     )
-
+    parser.add_argument(
+        "--no-display",
+        action="store_true",
+        help="Suppress the OpenCV preview window",
+    )
+    parser.add_argument(
+        "--fps",
+        type=int,
+        default=None,
+        help="Override presentation FPS (default: from config or 24)",
+    )
     args = parser.parse_args()
 
-    # Prepare timestamped outputs directory and logging
-    ts = time.strftime("%Y%m%d_%H%M%S")
+    # ── Timestamped output directory ──────────────────────────────────
+    ts      = time.strftime("%Y%m%d_%H%M%S")
     out_dir = os.path.join("outputs", ts)
     os.makedirs(out_dir, exist_ok=True)
 
-    output_video_path = os.path.join(out_dir, "inference.mp4")
-    output_log_path = os.path.join(out_dir, "inference.log")
+    output_video = args.output or os.path.join(out_dir, "inference.mp4")
+    log_path     = os.path.join(out_dir, "inference.log")
+    _setup_file_logger(log_path)
+    logger.info(f"TennIQ session started. Log: {log_path}")
 
-    fh = logging.FileHandler(output_log_path)
-    fh.setLevel(logging.INFO)
-    fmt = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    fh.setFormatter(fmt)
-    root_logger = logging.getLogger()
-    root_logger.addHandler(fh)
-    root_logger.setLevel(logging.INFO)
-    logger.info(f"Logging initialized. Writing logs to: {output_log_path}")
-
-    # Initialize analyzer with config file (the config should contain most runtime options)
+    # ── Build analyser ─────────────────────────────────────────────────
     analyzer = TennisAnalyzer(args.config)
-
-    # Use timestamped output directory by default; allow --output to override
-    analyzer.output_dir = out_dir
-    analyzer.output_path = output_video_path
+    analyzer.output_dir  = out_dir
+    analyzer.output_path = output_video
     analyzer.save_output = True
     analyzer.show_display = not args.no_display
-    if args.output:
-        analyzer.save_output = True
-        analyzer.output_path = args.output
-    fps_value = analyzer.config.get("PRESENTATION_FPS", analyzer.config.get("FPS", analyzer.presentation_fps))
-    try:
-        analyzer.set_presentation_fps(int(fps_value))
-    except Exception:
-        logger.warning("Invalid presentation FPS in config; using default")
 
-    # Run
+    # Presentation FPS (CLI > config > default)
+    pres_fps = args.fps
+    if pres_fps is None:
+        pres_fps = analyzer.config.get(
+            "PRESENTATION_FPS",
+            analyzer.config.get("FPS", analyzer.presentation_fps),
+        )
+    try:
+        analyzer.set_presentation_fps(int(pres_fps))
+    except (ValueError, TypeError):
+        logger.warning("Invalid presentation FPS; using default 24.")
+
+    # ── Run ────────────────────────────────────────────────────────────
     if args.mode == "video":
         analyzer.analyze_video(args.input)
     else:

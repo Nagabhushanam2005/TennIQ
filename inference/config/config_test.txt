@@ -31,7 +31,7 @@ BALL_FILL_PATH="models/ball_fill_model.joblib"
 # Tracking Options (true/false)
 ENABLE_BALL_TRACKING=true
 ENABLE_PLAYER_TRACKING=true
-ENABLE_COURT_TRACKING=false
+ENABLE_COURT_TRACKING=true
 
 # Scoreboard Settings
 ENABLE_SCOREBOARD=true

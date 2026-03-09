@@ -304,7 +304,13 @@ class NetDetector:
             Computed threshold value
         """
         h, w = gray.shape
-        y1, y2 = max(0, self.net_region.y1), min(h, self.net_region.y2)
+
+        # net_region may be None if court calibration has not run yet;
+        # fall back to the middle horizontal band of the frame.
+        if self.net_region is None:
+            y1, y2 = h // 3, h // 2
+        else:
+            y1, y2 = max(0, self.net_region.y1), min(h, self.net_region.y2)
         
         if y1 >= y2:
             return 128
@@ -556,7 +562,19 @@ class NetDetector:
         """
         if player_boxes is None:
             player_boxes = []
-        
+
+        # If net_region is still None (court calibration not yet done),
+        # create a sensible fallback from the frame dimensions so the
+        # detector can at least initialise without crashing.
+        if self.net_region is None:
+            h, w = frame.shape[:2]
+            self.net_region = NetRegion(x1=0, y1=h // 3, x2=w, y2=h // 2)
+            logger.debug(
+                "NetDetector: net_region was None; using fallback "
+                f"({self.net_region.x1},{self.net_region.y1},"
+                f"{self.net_region.x2},{self.net_region.y2})"
+            )
+
         # Auto-initialize on first frame
         if not self._initialized:
             self._initialize_threshold(frame)

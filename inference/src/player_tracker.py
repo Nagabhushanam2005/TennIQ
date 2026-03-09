@@ -435,5 +435,5 @@ class PlayerTracker:
             if tracker.frames_lost <= self.max_lost_frames:
                 pos, _, _ = tracker.current_position()
                 if pos:
-                    positions[i + 1] = pos 
+                    positions[i + 1] = pos
         return positions

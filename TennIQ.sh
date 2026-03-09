@@ -94,7 +94,6 @@ if [[ -z "$PYTHON_EXEC" ]]; then
     echo "Warning: PYTHON_EXEC environment variable not set. Defaulting to 'python3'."
     PYTHON_EXEC="python3"
 fi
-$PYTHON_EXEC data/web-scrapping/web-scrapping.py --config "$CONFIG_FILE"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in

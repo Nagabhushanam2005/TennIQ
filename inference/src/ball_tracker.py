@@ -68,7 +68,7 @@ class BallTracker:
 
     def _load_tracknet_model(self, model_weights, model_name):
         try:
-            from TrackNetv4.src.util import get_model
+            from inference.src.tracknet_pytorch import get_model
             INPUT_HEIGHT = 288
             INPUT_WIDTH = 512
 
@@ -91,12 +91,16 @@ class BallTracker:
 
         if len(self.frames_buffer) == 3:
             frames = self.frames_buffer.copy()
-            self.frames_buffer = [self.frames_buffer[-1]]
+            self.frames_buffer = self.frames_buffer[-2:]
             
             if self.model_type == 'yolo':
                 self._update_yolo(frames)
             else:
                 self._update_tracknet(frames)
+        else:
+            # Warmup: no detection yet, record None to keep temporal alignment
+            with self.lock:
+                self.ball_positions.append(None)
 
         # elif len(self.frames_buffer) < 3 and self.catboost_loaded and len(self.predicted_points_queue) >= 6:
         #     self._update_with_catboost(frame)
@@ -167,9 +171,12 @@ class BallTracker:
             if best_box is not None:
                 x_center, y_center, w, h = best_box
                 ball_point = (int(x_center), int(y_center))
-                with self.lock:
-                    self.predicted_points_queue.appendleft(ball_point)
-                    self.ball_positions.append(ball_point)
+
+        # Always record position (None if not detected) for temporal consistency
+        with self.lock:
+            if ball_point is not None:
+                self.predicted_points_queue.appendleft(ball_point)
+            self.ball_positions.append(ball_point)
 
     def _update_tracknet(self, frames):
         """TrackNet-based ball tracking"""
@@ -210,9 +217,12 @@ class BallTracker:
                     ball_point = (predicted_x_center, predicted_y_center)
                     with self.lock:
                         self.predicted_points_queue.appendleft(ball_point)
-                        self.ball_positions.append(ball_point)
         except Exception as e:
             logger.error(f"Error in TrackNet inference: {e}")
+
+        # Always record position (None if not detected) for temporal consistency
+        with self.lock:
+            self.ball_positions.append(ball_point)
 
 
     def _calculate_ratios(self, frame):
