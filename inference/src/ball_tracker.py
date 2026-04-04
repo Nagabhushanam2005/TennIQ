@@ -68,7 +68,7 @@ class BallTracker:
 
     def _load_tracknet_model(self, model_weights, model_name):
         try:
-            from inference.src.tracknet_pytorch import get_model
+            from TrackNetv4.src.util import get_model
             INPUT_HEIGHT = 288
             INPUT_WIDTH = 512
 
