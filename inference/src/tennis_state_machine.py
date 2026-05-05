@@ -17,11 +17,17 @@ class RallyState(Enum):
 
 
 class CourtSide(Enum):
+    # ISSUE #1 FIX: Court sides mapped by Y-coordinate position
+    # UPPER = Upper side of court (lower Y value, where Rear player is)
+    # LOWER = Lower side of court (higher Y value, where Front player is)
     UPPER = "upper"
     LOWER = "lower"
 
 
 class Player(Enum):
+    # ISSUE #1 FIX: Players mapped by Y-coordinate position
+    # UPPER = Rear player (lower Y value, at upper side of court/video)
+    # LOWER = Front player (higher Y value, at lower side of court/video)
     UPPER = 1
     LOWER = 2
 
@@ -117,14 +123,17 @@ class TennisScoringStateMachine:
 
     def __init__(
         self,
-        player1_name: str = "Player 1 (Rear)",
-        player2_name: str = "Player 2 (Front)",
+        player1_name: str = "Rear Player",
+        player2_name: str = "Front Player",
         *,
         best_of: int = 3,
     ):
         self.state = RallyState.WAITING_FOR_SERVE
         self.score = GameScore()
         self.rally = RallyContext(current_server=Player.UPPER)
+        # ISSUE #1: Player mapping by position (Y-coordinate)
+        # Player.UPPER = Rear player (lower Y value, upper side of court)
+        # Player.LOWER = Front player (higher Y value, lower side of court)
         self.player_names = {Player.UPPER: player1_name, Player.LOWER: player2_name}
         self.frame_height = 720
         self._last_message = ""
@@ -139,27 +148,39 @@ class TennisScoringStateMachine:
 
         logger.info(
             "TennisScoringStateMachine initialised "
-            f"(best-of-{best_of}, sets_to_win={self.SETS_TO_WIN})"
+            f"(best-of-{best_of}, sets_to_win={self.SETS_TO_WIN})\n"
+            f"  Player.UPPER (Rear): {player1_name}\n"
+            f"  Player.LOWER (Front): {player2_name}"
         )
 
     def set_net_y(self, net_y: int):
         self.NET_Y = net_y
-        logger.info(f"[StateMachine] Net Y set to {net_y}")
+        logger.info(  # DEBUG: Remove after diagnosis
+            f"[StateMachine] Net Y calibrated to {net_y} "
+            f"(frame height={self.frame_height}, position={100*net_y/self.frame_height:.1f}%)"
+        )
 
     @property
     def is_match_over(self) -> bool:
         return self.state == RallyState.MATCH_OVER
 
     def get_serve_context(self) -> Dict:
+        # Serve is only "active" after it's been hit (SERVE_IN_FLIGHT)
+        # Not during WAITING_FOR_SERVE (no serve hit yet)
         is_serve = self.state in {
-            RallyState.WAITING_FOR_SERVE,
-            RallyState.SERVE_IN_FLIGHT,
+            RallyState.SERVE_IN_FLIGHT,  # Serve has been hit, waiting for bounce
         }
         server_half = "far" if self.rally.current_server == Player.UPPER else "near"
         total_pts = (
             self.score.player_points[Player.UPPER] + self.score.player_points[Player.LOWER]
         )
         point_side = "deuce" if total_pts % 2 == 0 else "ad"
+        
+        logger.debug(  # DEBUG: Remove after diagnosis
+            f"[get_serve_context] state={self.state.value}, is_serve={is_serve}, "
+            f"server_half={server_half}, point_side={point_side}"
+        )
+        
         return {
             "is_serve": is_serve,
             "server_half": server_half,
@@ -241,12 +262,31 @@ class TennisScoringStateMachine:
         position: Optional[Tuple[int, int]],
         frame: int = 0,
         out_reason: Optional[str] = None,
+        player_positions: Optional[Dict[int, Tuple[int, int]]] = None,
+        in_bounds: Optional[bool] = None,
+        serve_fault_type: Optional[str] = None,
     ) -> Dict:
+        """Process an event from the event detector.
+        
+        Args:
+            event_type: HIT, BOUNCE, NET, etc.
+            position: Ball position (x, y)
+            frame: Frame number
+            out_reason: (Deprecated) Legacy out_reason field
+            player_positions: Dict of player positions for side inference
+            in_bounds: (New) For BOUNCE events - whether position is in court
+            serve_fault_type: (New) For BOUNCE events - "out", "wrong_box", or None
+        """
         if self.is_match_over:
             logger.debug("[StateMachine] Match is over — ignoring event.")
             return self._noop()
 
-        side = self._get_side(position)
+        logger.info(
+            f"[process_event] Received: type={event_type}, position={position}, "
+            f"player_positions={player_positions}, in_bounds={in_bounds}, serve_fault_type={serve_fault_type}"
+        )
+        
+        side = self._get_side(position, player_positions=player_positions)
         logger.info(
             f"[StateMachine] {event_type} side={side.value if side else '?'} "
             f"state={self.state.value} frame={frame} out_reason={out_reason}"
@@ -259,6 +299,45 @@ class TennisScoringStateMachine:
             )
             self.state = RallyState.WAITING_FOR_SERVE
 
+        if (self.state == RallyState.SERVE_IN_FLIGHT
+                and self.rally.last_hit_frame >= 0
+                and frame - self.rally.last_hit_frame > 90):
+            logger.warning(
+                "[StateMachine] SERVE_IN_FLIGHT timeout — "
+                f"no bounce for {frame - self.rally.last_hit_frame} frames, "
+                "resetting to WAITING_FOR_SERVE."
+            )
+            self._reset_rally()
+        
+        if (self.state == RallyState.RALLY_ACTIVE
+                and self.rally.last_hit_frame >= 0
+                and frame - self.rally.last_hit_frame > 180):
+            logger.warning(
+                "[StateMachine] RALLY_ACTIVE timeout — "
+                f"no hit detected for {frame - self.rally.last_hit_frame} frames, "
+                "resetting to WAITING_FOR_SERVE."
+            )
+            self._reset_rally()
+        
+        if (self.state == RallyState.SERVE_BOUNCED
+                and self.rally.last_bounce_frame >= 0
+                and frame - self.rally.last_bounce_frame > 120):
+            logger.warning(
+                "[StateMachine] SERVE_BOUNCED timeout — "
+                f"no return hit for {frame - self.rally.last_bounce_frame} frames, "
+                "awarding point to server (failed return)."
+            )
+            # Award point to server: receiver failed to return
+            winner = self.rally.current_server
+            self.state = RallyState.POINT_OVER
+            self._award_point(
+                winner,
+                frame=frame,
+                fault_type_str=FaultType.FAILED_RETURN,
+                message=f"Return timeout — {self.player_names[winner]} wins point",
+            )
+            return self._noop()
+
         handler = {
             RallyState.WAITING_FOR_SERVE: self._on_waiting_for_serve,
             RallyState.SERVE_IN_FLIGHT: self._on_serve_in_flight,
@@ -270,7 +349,7 @@ class TennisScoringStateMachine:
             logger.error(f"[StateMachine] No handler for state {self.state.value}")
             return self._noop()
 
-        result = handler(event_type, side, frame, out_reason)
+        result = handler(event_type, side, frame, out_reason, in_bounds, serve_fault_type)
         self.state = result["new_state"]
 
         if result["point_over"]:
@@ -290,6 +369,8 @@ class TennisScoringStateMachine:
         side: Optional[CourtSide],
         frame: int,
         out_reason: Optional[str],
+        in_bounds: Optional[bool] = None,
+        serve_fault_type: Optional[str] = None,
     ) -> Dict:
         if event_type == "HIT":
             detected_server = _player_for_side(side) or self.rally.current_server
@@ -315,6 +396,22 @@ class TennisScoringStateMachine:
                 ),
             )
 
+        if event_type == "BOUNCE":
+            logger.warning(
+                "[StateMachine] BOUNCE while waiting for serve — "
+                "ignoring (cannot assume serve happened). "
+                "Possible detection error or late-arriving event."
+            )
+            return self._noop()
+        
+        if event_type in ("OUT", "NET", "SERVE_FAULT"):
+            logger.warning(
+                f"[StateMachine] {event_type} event while WAITING_FOR_SERVE — "
+                f"invalid event sequence. Ignoring. "
+                f"Expected: HIT (serve detection) first."
+            )
+            return self._noop()
+
         return self._noop()
 
     def _on_serve_in_flight(
@@ -323,6 +420,8 @@ class TennisScoringStateMachine:
         side: Optional[CourtSide],
         frame: int,
         out_reason: Optional[str],
+        in_bounds: Optional[bool] = None,
+        serve_fault_type: Optional[str] = None,
     ) -> Dict:
         if event_type == "SERVE_FAULT":
             return self._handle_serve_fault(frame, out_reason or "serve_fault")
@@ -347,6 +446,29 @@ class TennisScoringStateMachine:
                 message="Serve bounced (in)",
             )
 
+        if event_type == "HIT":
+            # If we detect a hit on the receiver's side while serve is in flight, infer that the serve bounced but was missed by ball detection
+            receiver = self._opponent(self.rally.current_server)
+            receiver_side = SIDE_FOR_PLAYER[receiver]
+            if side is not None and side == receiver_side:
+                self.rally.last_bounce_side = receiver_side
+                self.rally.last_bounce_frame = max(0, frame - 2)
+                self.rally.bounce_count_this_side = 1
+                self.rally.last_hitter = receiver
+                self.rally.last_hit_side = side
+                self.rally.last_hit_frame = frame
+                self.rally.hit_after_bounce = True
+                self.rally.hit_count += 1
+                self.rally.net_crossed_after_hit = False
+                logger.info(
+                    "[StateMachine] HIT on receiver's side while serve in flight — "
+                    "inferring missed serve bounce."
+                )
+                return self._result(
+                    new_state=RallyState.RALLY_ACTIVE,
+                    message=f"{self.player_names[receiver]} returns serve (inferred bounce)",
+                )
+
         return self._noop()
 
     def _on_serve_bounced(
@@ -355,6 +477,8 @@ class TennisScoringStateMachine:
         side: Optional[CourtSide],
         frame: int,
         out_reason: Optional[str],
+        in_bounds: Optional[bool] = None,
+        serve_fault_type: Optional[str] = None,
     ) -> Dict:
         server = self.rally.current_server
         receiver = self._opponent(server)
@@ -373,26 +497,71 @@ class TennisScoringStateMachine:
             )
 
         if event_type == "BOUNCE":
+            # ISSUE #2 FIX: CHECK DOUBLE BOUNCE FIRST (before OUT/SERVE_FAULT)
             if side is not None and side == self.rally.last_bounce_side:
+                logger.info(
+                    "[StateMachine] DOUBLE BOUNCE detected on serve — "
+                    f"same side ({side.value}) as last bounce. "
+                    f"{self.player_names[server]} wins point."
+                )
                 return self._result(
                     new_state=RallyState.POINT_OVER,
                     point_over=True,
                     point_winner=server,
-                    fault_type=FaultType.FAILED_RETURN,
+                    fault_type=FaultType.DOUBLE_BOUNCE,
                     message=(
                         f"Double bounce — {self.player_names[server]} wins point "
                         "(receiver failed to return serve)"
                     ),
                 )
 
-            logger.warning(
-                "[StateMachine] Bounce switched sides after serve without "
-                "an intervening hit — possible detection error."
+            # THEN check for serve faults
+            if serve_fault_type is not None:
+                logger.info(
+                    f"[StateMachine] SERVE_FAULT ({serve_fault_type}) detected. "
+                    f"{self.player_names[server]} wins point."
+                )
+                return self._result(
+                    new_state=RallyState.POINT_OVER,
+                    point_over=True,
+                    point_winner=server,
+                    fault_type=FaultType.SERVE_FAULT,
+                    message=(
+                        f"Serve fault ({serve_fault_type}) — "
+                        f"{self.player_names[server]} wins point"
+                    ),
+                )
+
+            # FINALLY check if out of bounds (only if not in court and not double bounce)
+            if in_bounds is False:
+                logger.info(
+                    "[StateMachine] OUT detected on serve. "
+                    f"{self.player_names[server]} wins point."
+                )
+                return self._result(
+                    new_state=RallyState.POINT_OVER,
+                    point_over=True,
+                    point_winner=server,
+                    fault_type=FaultType.OUT_OF_BOUNDS,
+                    message=(
+                        f"Out (out_of_bounds) — "
+                        f"{self.player_names[server]} wins point"
+                    ),
+                )
+
+            # Normal bounce on correct side
+            logger.info(
+                f"[StateMachine] Valid serve bounce on {side.value if side else '?'} side. "
+                "Receiver should return."
             )
             self.rally.last_bounce_side = side
             self.rally.last_bounce_frame = frame
             self.rally.bounce_count_this_side = 1
-            return self._noop()
+            self.rally.net_crossed_after_hit = True
+            return self._result(
+                new_state=RallyState.SERVE_BOUNCED,
+                message="Serve bounced (in)",
+            )
 
         if event_type == "OUT":
             return self._result(
@@ -414,6 +583,19 @@ class TennisScoringStateMachine:
                 fault_type=FaultType.NET,
                 message=f"Net — {self.player_names[server]} wins point",
             )
+        
+        if event_type == "SERVE_FAULT":
+            logger.warning(
+                "[StateMachine] SERVE_FAULT event while SERVE_BOUNCED — "
+                "unexpected event sequence. Treating as OUT."
+            )
+            return self._result(
+                new_state=RallyState.POINT_OVER,
+                point_over=True,
+                point_winner=server,
+                fault_type=FaultType.OUT_OF_BOUNDS,
+                message=f"Serve fault (invalid sequence) — {self.player_names[server]} wins point",
+            )
 
         return self._noop()
 
@@ -423,6 +605,8 @@ class TennisScoringStateMachine:
         side: Optional[CourtSide],
         frame: int,
         out_reason: Optional[str],
+        in_bounds: Optional[bool] = None,
+        serve_fault_type: Optional[str] = None,
     ) -> Dict:
         if event_type == "OUT":
             winner = self._opponent(self.rally.last_hitter) if self.rally.last_hitter else None
@@ -447,16 +631,31 @@ class TennisScoringStateMachine:
             )
 
         if event_type == "BOUNCE":
-            return self._handle_rally_bounce(side, frame)
+            return self._handle_rally_bounce(side, frame, in_bounds)
 
         if event_type == "HIT":
             return self._handle_rally_hit(side, frame)
+        
+        if event_type == "SERVE_FAULT":
+            logger.warning(
+                "[StateMachine] SERVE_FAULT event while RALLY_ACTIVE — "
+                "unexpected event sequence. Ignoring."
+            )
+            return self._noop()
 
         return self._noop()
 
-    def _handle_rally_bounce(self, side: Optional[CourtSide], frame: int) -> Dict:
+    def _handle_rally_bounce(self, side: Optional[CourtSide], frame: int, in_bounds: Optional[bool] = None) -> Dict:
+        # If we get a bounce event with no side info, but we have a recent bounce on record, infer that the bounce is on the same side if it's within a reasonable frame gap
+        if side is None and self.rally.last_bounce_side is not None:
+            if (self.rally.last_hit_frame <= self.rally.last_bounce_frame
+                    and frame - self.rally.last_bounce_frame < 30):
+                side = self.rally.last_bounce_side
+                logger.info(f"[StateMachine] Inferred bounce side={side.value} from context")
+
         same_side = side is not None and side == self.rally.last_bounce_side
 
+        # ISSUE #2 FIX: CHECK DOUBLE BOUNCE FIRST (before OUT)
         if same_side:
             hit_crossed = (
                 self.rally.last_hitter is not None
@@ -471,6 +670,10 @@ class TennisScoringStateMachine:
                     winner = _player_for_side(self._opposite_side(side)) or Player.UPPER
 
                 loser = self._opponent(winner)
+                logger.info(
+                    f"[StateMachine] DOUBLE BOUNCE in rally on {side.value} side. "
+                    f"{self.player_names[winner]} wins point (opponent failed to return)."
+                )
                 return self._result(
                     new_state=RallyState.POINT_OVER,
                     point_over=True,
@@ -482,6 +685,22 @@ class TennisScoringStateMachine:
                     ),
                 )
 
+        # THEN check if out of bounds (only if not double bounce)
+        if in_bounds is False:
+            winner = self._opponent(self.rally.last_hitter) if self.rally.last_hitter else None
+            winner_name = self.player_names[winner] if winner else "?"
+            logger.info(
+                f"[StateMachine] OUT in rally. {winner_name} wins point."
+            )
+            return self._result(
+                new_state=RallyState.POINT_OVER,
+                point_over=True,
+                point_winner=winner,
+                fault_type=FaultType.OUT_OF_BOUNDS,
+                message=f"Out (out_of_bounds) — {winner_name} wins point",
+            )
+
+        # Normal bounce - continue rally
         self.rally.last_bounce_side = side
         self.rally.last_bounce_frame = frame
         self.rally.bounce_count_this_side = (
@@ -511,6 +730,22 @@ class TennisScoringStateMachine:
                 point_winner=winner,
                 fault_type=FaultType.DOUBLE_HIT,
                 message=f"Double hit — {self.player_names[winner]} wins point",
+            )
+
+        # If we detect a hit on the opposite side without an intervening bounce, infer that a bounce was missed by detection
+        if (
+            self.rally.last_hit_side is not None
+            and side is not None
+            and side != self.rally.last_hit_side
+        ):
+            inferred_bounce_side = side
+            inferred_bounce_frame = max(0, frame - 2)
+            self.rally.last_bounce_side = inferred_bounce_side
+            self.rally.last_bounce_frame = inferred_bounce_frame
+            self.rally.bounce_count_this_side = 1
+            logger.info(
+                f"[StateMachine] HIT on opposite side — inferring missed bounce "
+                f"on {inferred_bounce_side.value} side at frame {inferred_bounce_frame}"
             )
 
         hitter = expected_hitter or (
@@ -697,11 +932,98 @@ class TennisScoringStateMachine:
             message=f"Fault ({reason}) — {server_name} 2nd serve",
         )
 
-    def _get_side(self, position: Optional[Tuple[int, int]]) -> Optional[CourtSide]:
-        if position is None:
+    def _get_side(self, ball_position: Optional[Tuple[int, int]], 
+                   player_positions: Optional[Dict[int, Tuple[int, int]]] = None) -> Optional[CourtSide]:
+        """
+        Determine which side the hitter is on.
+        
+        Args:
+            ball_position: Ball (x,y) position when hit occurred
+            player_positions: Dict of {player_id: (x,y)} for all players
+        
+        Returns:
+            CourtSide.UPPER (y < net_y), CourtSide.LOWER (y >= net_y), or None
+            
+        Strategy:
+            1. If player positions available: return side of player closest to ball
+               (based on player's actual Y position, not their ID)
+            2. Fallback: use ball Y position relative to net (camera-dependent!)
+        """
+        # STRATEGY 1: Use player positions if available
+        if player_positions and ball_position:
+            logger.debug(  # Changed from INFO to DEBUG
+                f"[_get_side] Using player_positions: {player_positions}, "
+                f"ball={ball_position}"
+            )
+            closest_player_id = self._find_closest_player(ball_position, player_positions)
+            if closest_player_id is not None:
+                # Determine side based on player's actual Y position, NOT their ID
+                player_y = player_positions[closest_player_id][1]
+                net_y = self.NET_Y if self.NET_Y is not None else int(self.frame_height * 0.5)
+                side = CourtSide.UPPER if player_y < net_y else CourtSide.LOWER
+                
+                logger.debug(
+                    f"[_get_side] Player {closest_player_id} at Y={player_y}, "
+                    f"net_y={net_y} → side={side.value}"
+                )
+                return side
+            else:
+                logger.warning(f"[_get_side] Failed to find closest player to {ball_position}")
+        else:
+            if not player_positions:
+                logger.debug("[_get_side] No player_positions provided, using fallback")
+            if not ball_position:
+                logger.debug("[_get_side] No ball_position provided")
+        
+        # Strategy 2: Fallback to ball Y position (camera-dependent, may be inverted)
+        if ball_position is None:
+            logger.warning("[_get_side] Cannot determine side: ball_position is None")
             return None
-        net_y = self.NET_Y if self.NET_Y is not None else self.frame_height // 2
-        return CourtSide.UPPER if position[1] < net_y else CourtSide.LOWER
+            
+        net_y = self.NET_Y if self.NET_Y is not None else int(self.frame_height * 0.5)
+        
+        logger.warning(
+            f"[_get_side] FALLBACK to ball Y position: "
+            f"ball_y={ball_position[1]}, net_y={net_y}. "
+            f"NOTE: Result depends on camera orientation. If serves marked as faults, "
+            f"this fallback may be inverted."
+        )
+        
+        # Fallback to using ball Y position relative to net
+        return CourtSide.UPPER if ball_position[1] < net_y else CourtSide.LOWER
+    
+    def _find_closest_player(self, ball_position: Tuple[int, int], 
+                            player_positions: Dict[int, Tuple[int, int]]) -> Optional[int]:
+        """
+        Find which player is closest to the ball.
+        
+        Args:
+            ball_position: (x, y) coordinates of ball
+            player_positions: {player_id: (x,y)} dict
+        
+        Returns:
+            Player ID (1 or 2) of closest player, or None if no players
+        """
+        if not player_positions:
+            logger.warning(f"[_find_closest_player] Empty player_positions dict")
+            return None
+        
+        min_distance = float('inf')
+        closest_player = None
+        
+        logger.debug(f"[_find_closest_player] ball={ball_position}, players={player_positions}")
+        
+        for player_id, player_pos in player_positions.items():
+            # Euclidean distance
+            dist = ((ball_position[0] - player_pos[0])**2 + 
+                   (ball_position[1] - player_pos[1])**2) ** 0.5
+            logger.debug(f"  player_id={player_id}, pos={player_pos}, distance={dist:.1f}")
+            if dist < min_distance:
+                min_distance = dist
+                closest_player = player_id
+        
+        logger.info(f"[_find_closest_player] Closest: player_id={closest_player}, distance={min_distance:.1f}")
+        return closest_player
 
     @staticmethod
     def _opposite_side(side: Optional[CourtSide]) -> Optional[CourtSide]:

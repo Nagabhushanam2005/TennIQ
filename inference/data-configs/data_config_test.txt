@@ -1,6 +1,6 @@
 YOUTUBE_URL = "https://www.youtube.com/watch?v=zEu-xrXRhuk"
-VIDEO_OUTPUT_PATH = "data/web-scrapping/videofeed/near_out.mp4"
+VIDEO_OUTPUT_PATH = "/home/abhishek/Downloads/game13/Clip9.mp4"
 FRAMES_DIR = "data/web-scrapping/frames_test"
-FRAME_START = 1
-FRAME_END = 5000
+FRAME_START = 0
+#FRAME_END = 1000
 #LIMIT_NUM_FRAMES = 3000

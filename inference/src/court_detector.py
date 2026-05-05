@@ -59,7 +59,7 @@ class CourtDetector:
         v = self.verbose if verbose is None else verbose
 
         imgs_dir    = self._CPP_DETECTOR_DIR / "imgs"
-        img_path    = imgs_dir / "input_img.png"
+        img_path    = imgs_dir / "img.png"
         output_path = self._CPP_DETECTOR_DIR / "output.txt"
 
         try:
@@ -68,7 +68,6 @@ class CourtDetector:
             logger.error(f"CourtDetector: cannot create imgs dir: {exc}")
             return None
 
-        # Remove stale output so a failed run cannot return old keypoints
         if output_path.exists():
             try:
                 output_path.unlink()
@@ -121,6 +120,10 @@ class CourtDetector:
             return None
 
         elapsed = time.time() - t0
+
+        # ALWAYS show stdout for diagnostic info
+        if result.stdout.strip():
+            logger.info(f"CourtDetector diagnostic output:\n{result.stdout.strip()}")
 
         # Always surface stderr — this is the key diagnostic information
         if result.stderr.strip():

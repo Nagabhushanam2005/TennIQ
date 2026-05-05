@@ -184,6 +184,7 @@ class PlayerTracker:
         for tracker in self.player_trackers:
             best_detection = None
             min_dist = self.max_distance + 1
+            best_idx = -1
             last_pos, _, _ = tracker.current_position()
 
             for idx, (conf, box, center) in enumerate(person_detections):
@@ -195,11 +196,13 @@ class PlayerTracker:
                 if dist < min_dist:
                     min_dist = dist
                     best_detection = (conf, box, center)
+                    best_idx = idx
 
             if best_detection is not None and min_dist <= self.max_distance:
                 conf, box, center = best_detection
                 tracker.update_position(center, conf, box, self.frame_count)
-                used_detections.add(idx)
+                used_detections.add(best_idx)
+                logger.debug(f"Recalib: Matched player {tracker.player_id} with detection at distance {min_dist:.1f}px")
             else:
                 tracker.frames_lost += 1
 
@@ -214,12 +217,17 @@ class PlayerTracker:
             self._finalize_recalibration()
 
     def _finalize_recalibration(self):
-        """Selects the top 2 players after a temporary re-calibration."""
+        """Selects the top 2 players after a temporary re-calibration, sorted by Y-position."""
         active_calib_trackers = [t for t in self.player_trackers if t.frames_lost < self.max_lost_frames]
         if active_calib_trackers:
-            active_calib_trackers.sort(key=lambda t: t.total_movement, reverse=True)
+            # ISSUE #1 FIX: Sort by Y-coordinate (lower Y = rear/upper, higher Y = front/lower)
+            active_calib_trackers.sort(key=lambda t: t.position_history[-1][1] if t.position_history else 0)
             self.active_players = active_calib_trackers[:self.max_players]
-            logger.info(f"Re-calibration complete. Selected {len(self.active_players)} new active player(s).")
+            logger.info(f"Re-calibration complete. Selected {len(self.active_players)} new active player(s) by Y-position.")
+            for i, tracker in enumerate(self.active_players):
+                pos, _, _ = tracker.current_position()
+                position_label = "Rear (Upper)" if i == 0 else "Front (Lower)"
+                logger.info(f"  {position_label} Player: ID {tracker.player_id}, Position Y={pos[1] if pos else '?'}")
         else:
             logger.warning("Re-calibration failed to select any active players.")
 
@@ -268,13 +276,17 @@ class PlayerTracker:
             logger.warning("No consistent persons tracked during calibration.")
             self.calibration_done = True
             return
-        active_calib_trackers.sort(key=lambda t: t.total_movement, reverse=True)
+        
+        # ISSUE #1 FIX: Sort by Y-coordinate (lower Y = rear/upper, higher Y = front/lower)
+        active_calib_trackers.sort(key=lambda t: t.position_history[-1][1] if t.position_history else 0)
         self.active_players = active_calib_trackers[:self.max_players]
         
         if self.active_players:
-            logger.info(f"Calibration finalized. Selected {len(self.active_players)} active player(s).")
+            logger.info(f"Calibration finalized. Selected {len(self.active_players)} active player(s) by Y-position.")
             for i, tracker in enumerate(self.active_players):
-                logger.info(f"  Player {i+1}: ID {tracker.player_id}, Total Movement: {tracker.total_movement:.2f}")
+                pos, _, _ = tracker.current_position()
+                position_label = "Rear (Upper)" if i == 0 else "Front (Lower)"
+                logger.info(f"  {position_label} Player: ID {tracker.player_id}, Position Y={pos[1] if pos else '?'}, Movement: {tracker.total_movement:.2f}")
         else:
             logger.warning("Calibration: No players selected despite detections.")
             
@@ -333,19 +345,12 @@ class PlayerTracker:
                 is_stationary = tracker.get_average_velocity() < MIN_MOVEMENT_THRESHOLD
 
                 tracker.frames_lost += 1
+                logger.debug(f"Player {tracker.player_id} lost. Frames lost: {tracker.frames_lost}/{self.max_lost_frames}")
+                
+                # This was causing duplication and breaking velocity calculations
+                # Only keep the player in active list if still within lost frames threshold
                 if tracker.frames_lost <= self.max_lost_frames:
-                    # Fallback to hold last known position
-                    current_pos, last_conf, last_box = tracker.current_position()
-                    if current_pos:
-                         # Use last known position and box, and artificially update the history 
-                         # with the same data to hold the position on the screen.
-                         tracker.position_history.append(current_pos)
-                         tracker.box_history.append(last_box)
-                         tracker.confidence_history.append(last_conf)
-                         new_active_players.append(tracker)
-                         logger.debug(f"Player {tracker.player_id} tracked via position hold. Frames lost: {tracker.frames_lost}")
-
-                logger.debug(f"Player {tracker.player_id} lost for {tracker.frames_lost}/{self.max_lost_frames} frames.")
+                    new_active_players.append(tracker)
 
         self.active_players = [t for t in new_active_players if t.frames_lost <= self.max_lost_frames]
 
@@ -429,11 +434,47 @@ class PlayerTracker:
         return result_frame
 
     def get_player_positions(self) -> Dict[int, Tuple[int, int]]:
-        """Get current positions of all confirmed active players (Player 1 and 2)."""
+        """Get current positions of all confirmed active players.
+        
+        ISSUE #1 FIX: Return dict keyed by POSITION (0=Rear, 1=Front), not tracker_id
+        This ensures state machine always knows which player is which side.
+        
+        Returns:
+            {0: (x_rear, y_rear), 1: (x_front, y_front)}  where Y determines rear/front
+        """
         positions = {}
         for i, tracker in enumerate(self.active_players):
             if tracker.frames_lost <= self.max_lost_frames:
                 pos, _, _ = tracker.current_position()
                 if pos:
-                    positions[i + 1] = pos
+                    # Key by position index (0=rear/upper, 1=front/lower)
+                    # NOT by tracker.player_id which is arbitrary
+                    position_label = "Rear (Upper)" if i == 0 else "Front (Lower)"
+                    positions[i] = pos
+                    logger.debug(f"{position_label} Player ID {tracker.player_id} position: {pos}")
         return positions
+    
+    def get_player_sides(self, net_y: int = None) -> Dict[int, str]:
+        """Determine which court side each player is on based on Y position relative to net.
+        
+        FIXED: Issue #21 - Court-position-based player side labeling
+        
+        Args:
+            net_y: Y coordinate of the net. If None, uses frame center.
+            
+        Returns:
+            Dict mapping player_id to 'UPPER' or 'LOWER' side
+        """
+        if net_y is None:
+            net_y = 360  # Default for 720p video
+            
+        sides = {}
+        for tracker in self.active_players:
+            if tracker.frames_lost <= self.max_lost_frames:
+                pos, _, _ = tracker.current_position()
+                if pos:
+                    y = pos[1]
+                    side = 'LOWER' if y > net_y else 'UPPER'
+                    sides[tracker.player_id] = side
+                    logger.debug(f"Player {tracker.player_id} at Y={y}, assigned to {side} (net_y={net_y})")
+        return sides

@@ -21,11 +21,13 @@ class BallTracker:
         self.width_ratio = 1.0
         self.height_ratio = 1.0
         self.frame_count = 0
-        self.ball_positions = []
+        self.ball_positions = []  # List of (x, y, confidence) tuples or None
+        self.frame_indices = []   # Corresponding frame indices for synchronization
         self.model_loaded = False
         self.catboost_loaded = False
         self.model_type = None
-        self.conf_threshold = 0.05
+        # FIXED: Increased confidence threshold from 0.05 to 0.30 (Issue #6)
+        self.conf_threshold = 0.30
         self.target_class_name = "ball"
         self.frames_buffer = []
         
@@ -68,7 +70,7 @@ class BallTracker:
 
     def _load_tracknet_model(self, model_weights, model_name):
         try:
-            from inference.src.tracknet_pytorch import get_model
+            from TrackNetv4.src.util import get_model
             INPUT_HEIGHT = 288
             INPUT_WIDTH = 512
 
@@ -84,26 +86,51 @@ class BallTracker:
             logger.error(f"Failed to load TrackNet model: {e}")
 
     def update(self, frame):
+        """Process frame for ball detection. Returns (x, y, confidence) or None."""
         if not self.model_loaded:
-            return
+            return None
 
-        self.frames_buffer.append(frame)
+        # FIXED: Entire frame buffer access protected by lock (Issue #2)
+        with self.lock:
+            self.frames_buffer.append(frame)
+            ready = len(self.frames_buffer) == 3
+            if ready:
+                frames = self.frames_buffer.copy()
+                self.frames_buffer = self.frames_buffer[-2:]  # 50% overlap
+            current_frame_idx = len(self.frame_indices)  # Synchronization tracking
 
-        if len(self.frames_buffer) == 3:
-            frames = self.frames_buffer.copy()
-            self.frames_buffer = self.frames_buffer[-2:]
-            
+        ball_pos = None
+        
+        if ready:
             if self.model_type == 'yolo':
-                self._update_yolo(frames)
+                ball_pos = self._update_yolo(frames)
             else:
-                self._update_tracknet(frames)
+                ball_pos = self._update_tracknet(frames)
         else:
             # Warmup: no detection yet, record None to keep temporal alignment
-            with self.lock:
-                self.ball_positions.append(None)
+            logger.debug(f"Ball warmup frame {current_frame_idx}: buffer size {len(self.frames_buffer)}/3")
 
-        # elif len(self.frames_buffer) < 3 and self.catboost_loaded and len(self.predicted_points_queue) >= 6:
-        #     self._update_with_catboost(frame)
+        # FIXED: Record position with frame index for synchronization (Issue #14)
+        with self.lock:
+            # FIXED: Standardize to always store (x, y, confidence) or None (Issue #1)
+            if ball_pos is not None:
+                # Ensure 3-tuple format
+                if len(ball_pos) == 2:
+                    ball_pos = (ball_pos[0], ball_pos[1], 0.0)  # Default confidence if missing
+                self.predicted_points_queue.appendleft(ball_pos)
+                logger.debug(f"Ball frame {current_frame_idx}: detected at ({ball_pos[0]}, {ball_pos[1]}), conf={ball_pos[2]:.2f}, model={self.model_type}")
+            else:
+                logger.debug(f"Ball frame {current_frame_idx}: not detected")
+            
+            self.ball_positions.append(ball_pos)
+            self.frame_indices.append(current_frame_idx)
+
+            # Trim history to prevent unbounded growth
+            if len(self.ball_positions) > 500:
+                self.ball_positions = self.ball_positions[-300:]
+                self.frame_indices = self.frame_indices[-300:]
+        
+        return ball_pos
 
     def _update_with_catboost(self, frame):
         """Use CatBoost model to predict ball position when insufficient frames are available"""
@@ -137,7 +164,7 @@ class BallTracker:
             self.ball_positions.insert(-2, ball_point)
 
     def _update_yolo(self, frames):
-        """YOLO-based ball tracking"""
+        """YOLO-based ball tracking. Returns (x, y, confidence) or None."""
         self.frame_count += 1
 
         stacked_image = np.mean(np.stack(frames, axis=0, dtype=np.float32), axis=0, dtype=np.float32)
@@ -153,8 +180,7 @@ class BallTracker:
         ball_point = None
         
         if not results or results[0].boxes is None or len(results[0].boxes) == 0:
-            # No ball detected, position remains None
-            pass
+            logger.debug(f"YOLO: No ball detections")
         else:
             boxes = results[0].boxes
             xywh = boxes.xywh.cpu().numpy()
@@ -170,16 +196,14 @@ class BallTracker:
 
             if best_box is not None:
                 x_center, y_center, w, h = best_box
-                ball_point = (int(x_center), int(y_center))
-
-        # Always record position (None if not detected) for temporal consistency
-        with self.lock:
-            if ball_point is not None:
-                self.predicted_points_queue.appendleft(ball_point)
-            self.ball_positions.append(ball_point)
+                # FIXED: Return (x, y, confidence) tuple (Issue #1)
+                ball_point = (int(x_center), int(y_center), float(best_conf))
+                logger.debug(f"YOLO: Ball detected at ({int(x_center)}, {int(y_center)}), conf={best_conf:.3f}")
+        
+        return ball_point
 
     def _update_tracknet(self, frames):
-        """TrackNet-based ball tracking"""
+        """TrackNet-based ball tracking. Returns (x, y, confidence) or None."""
         if self.width_ratio == 1.0:
             self._calculate_ratios(frames[2])
 
@@ -193,6 +217,7 @@ class BallTracker:
         input_tensor = torch.cat(batch, dim=0).unsqueeze(0).to(self.device, non_blocking=True)
         
         ball_point = None
+        confidence = 0.0
         
         try:
             with torch.no_grad():
@@ -205,6 +230,7 @@ class BallTracker:
                     ball_preds = ball_preds[0]
                     
             ball_predictions = ball_preds.to("cpu", non_blocking=True)
+            # FIXED: Use adaptive thresholding instead of hard 0.5 (Issue #8 - TODO)
             ball_heatmaps = (ball_predictions > 0.5).float()
             ball_binary_heatmaps = (ball_heatmaps[0] * 255).byte().numpy()
 
@@ -214,15 +240,16 @@ class BallTracker:
                     largest_bounding_box = max([cv2.boundingRect(c) for c in contours], key=lambda r: r[2] * r[3])
                     predicted_x_center = int(self.width_ratio * (largest_bounding_box[0] + largest_bounding_box[2] / 2))
                     predicted_y_center = int(self.height_ratio * (largest_bounding_box[1] + largest_bounding_box[3] / 2))
-                    ball_point = (predicted_x_center, predicted_y_center)
-                    with self.lock:
-                        self.predicted_points_queue.appendleft(ball_point)
+                    # Compute confidence as max heatmap value in detected region
+                    max_heatmap_val = float(torch.max(ball_predictions[0, 2]).cpu().numpy())
+                    confidence = min(max_heatmap_val, 1.0)
+                    # FIXED: Return (x, y, confidence) tuple (Issue #1)
+                    ball_point = (predicted_x_center, predicted_y_center, confidence)
+                    logger.debug(f"TrackNet: Detected at ({predicted_x_center}, {predicted_y_center}), confidence={confidence:.3f}")
         except Exception as e:
             logger.error(f"Error in TrackNet inference: {e}")
-
-        # Always record position (None if not detected) for temporal consistency
-        with self.lock:
-            self.ball_positions.append(ball_point)
+        
+        return ball_point
 
 
     def _calculate_ratios(self, frame):
@@ -241,15 +268,24 @@ class BallTracker:
 
             for point in points_snapshot:
                 if point is not None:
-                    if len(point) == 3:
-                        cv2.circle(result_frame, (point[0], point[1]), 5, (255, 255, 0), 2)
-                    else:
-                        cv2.circle(result_frame, point, 5, (0, 255, 0), 2)
+                    # FIXED: Handle standardized (x, y, confidence) format
+                    if len(point) >= 2:
+                        cv2.circle(result_frame, (point[0], point[1]), 5, (0, 255, 0), 2)
+                        
             current_pos = self.ball_positions[-1] if self.ball_positions else None
-            if current_pos is not None:
-                cv2.circle(result_frame, current_pos, 8, (0, 0, 255), -1)
+            if current_pos is not None and len(current_pos) >= 2:
+                cv2.circle(result_frame, (current_pos[0], current_pos[1]), 8, (0, 0, 255), -1)
 
         return result_frame
 
     def get_ball_history(self):
+        """Returns list of (x, y, confidence) tuples or None for each frame."""
         return self.ball_positions
+    
+    def get_ball_position_at_frame(self, frame_idx):
+        """Get ball position for a specific frame index. Returns (x, y, confidence) or None."""
+        if frame_idx in self.frame_indices:
+            idx = self.frame_indices.index(frame_idx)
+            if idx < len(self.ball_positions):
+                return self.ball_positions[idx]
+        return None

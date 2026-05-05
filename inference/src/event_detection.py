@@ -20,7 +20,7 @@ EVENT_OUT = "OUT"
 EVENT_NET = "NET"
 EVENT_SERVE_FAULT = "SERVE_FAULT"
 
-# BGR colours for drawing each event type
+
 EVENT_COLORS = {
     EVENT_HIT: (255, 0, 0),           # Blue
     EVENT_BOUNCE: (0, 125, 255),       # Orange
@@ -58,16 +58,18 @@ class EventDetector:
 
         self.events: Dict[int, List[Dict]] = {}
         self.frame_count = 0
-        self.last_input = None
+        self.last_input = 0
         self.last_event = 0
+        self.last_catboost_event = 0
+        self.catboost_cooldown = 4
         self.frame_width = 1280
         self.frame_height = 720
         self.model = None
-        self.threshold = 0.85
+        self.threshold = 0.8
         self.last_known_bounce_frames: Set[int] = set()
         self.eventstring = ""
 
-        # Court geometry caches (populated lazily from court_detector)
+        # Court geometry caches
         self._court_polygon = None      # singles boundary for in/out
         self._service_boxes: Dict[str, np.ndarray] = {}
         self._net_y: Optional[int] = None
@@ -209,10 +211,17 @@ class EventDetector:
         return None
 
     def _is_valid_serve_landing(self, position) -> bool:
-        """Return *True* if the bounce is in the correct service box."""
-        if not self._serve_context or not self._serve_context.get("is_serve"):
+        """Return *True* if the bounce is in the correct service box for the current serve.
+        """
+        if not self._serve_context:
+            logger.warning("_is_valid_serve_landing called without serve_context - assuming valid")
             return True
+            
+        if not self._serve_context.get("is_serve"):
+            return True
+        
         if not self._service_boxes:
+            logger.warning("Service boxes not loaded - cannot validate serve landing, assuming valid for safety")
             return True
 
         server_half = self._serve_context.get("server_half", "far")
@@ -225,32 +234,52 @@ class EventDetector:
             expected = "upper_left" if point_side == "deuce" else "upper_right"
 
         actual = self._service_box_for_point(position)
-        return actual == expected
+        
+        if actual is None:
+            logger.warning(f"Serve landing position {position} not in any service box → FAULT")
+            return False
+            
+        is_valid = actual == expected
+        if not is_valid:
+            logger.warning(f"Serve landing in {actual}, expected {expected} → FAULT")
+        else:
+            logger.info(f"Serve landing in {actual} (expected {expected}) → valid")
+            
+        return is_valid
 
     # ── Bounce classification ────────────────────────────────────────────
 
-    def _classify_bounce(self, position) -> Tuple[str, Optional[str]]:
+    def _classify_bounce(self, position) -> Dict:
         """
-        Decide whether a CatBoost-detected bounce is BOUNCE, OUT, or
-        SERVE_FAULT.
+        Classify a CatBoost-detected bounce event with metadata.
+        
+        IMPORTANT: Always returns BOUNCE event type with metadata fields.
+        The state machine will check for double bounce FIRST, then use metadata
+        to determine if it's OUT or SERVE_FAULT.
 
         Returns:
-            (event_type, out_reason)   – *out_reason* is None for BOUNCE.
+            dict with keys:
+              - type: "BOUNCE"
+              - in_bounds: bool (whether position is in court)
+              - serve_fault_type: str or None ("out" or "wrong_box" for serves)
         """
         in_court = self._is_in_court(position)
         is_serve = (self._serve_context is not None
                     and self._serve_context.get("is_serve", False))
-
+        
+        # Determine if this is a serve fault
+        serve_fault_type = None
         if not in_court:
             if is_serve:
-                return EVENT_SERVE_FAULT, "out"
-            return EVENT_OUT, "out_of_bounds"
-
-        # In-court during a serve → check correct service box
-        if is_serve and not self._is_valid_serve_landing(position):
-            return EVENT_SERVE_FAULT, "wrong_box"
-
-        return EVENT_BOUNCE, None
+                serve_fault_type = "out"
+        elif is_serve and not self._is_valid_serve_landing(position):
+            serve_fault_type = "wrong_box"
+        
+        return {
+            "type": EVENT_BOUNCE,
+            "in_bounds": in_court,
+            "serve_fault_type": serve_fault_type,
+        }
 
     # ── Net-hit detection (via NetDetector) ──────────────────────────────
 
@@ -259,21 +288,41 @@ class EventDetector:
         if self.player_tracker is None:
             return []
         boxes: List[List[int]] = []
-        for player in getattr(self.player_tracker, "active_players", []):
-            _, _, box = player.current_position()
-            if box is not None:
-                boxes.append(list(box))
+        
+        # Try to get active players from tracker
+        active_players = getattr(self.player_tracker, "active_players", None)
+        if active_players is None:
+            # Fallback: check for 'players' attribute
+            active_players = getattr(self.player_tracker, "players", [])
+        
+        for player in active_players:
+            try:
+                _, _, box = player.current_position()
+                if box is not None:
+                    boxes.append(list(box))
+            except Exception as e:
+                logger.warning(f"Error extracting player box: {e}")  # DEBUG: Remove after diagnosis
+                continue
+        
+        if not boxes and getattr(self.player_tracker, "active_players", None) is not None:
+            logger.warning(f"No player boxes extracted from {len(active_players)} active players")
+        
         return boxes
 
     def _detect_net_hit(self, frame: np.ndarray) -> Optional[Dict]:
         """Run the net detector on *frame* and return an event dict or None."""
         if self.net_detector is None:
             return None
+        
         # Skip if net region has not been calibrated yet to avoid a crash
         # inside NetDetector._compute_adaptive_threshold.  The fallback
         # region is set lazily inside NetDetector.detect() on the very
         # first call, so subsequent frames will work fine.
         player_boxes = self._get_player_boxes()
+        
+        if self.frame_count <= 10:
+            logger.debug(f"Net detection @ frame {self.frame_count}: {len(player_boxes)} player boxes")  # DEBUG: Remove after diagnosis
+        
         net_event = self.net_detector.detect(frame, player_boxes=player_boxes)
         if net_event is None:
             return None
@@ -287,11 +336,12 @@ class EventDetector:
             "type": EVENT_NET,
             "position": position,
             "confidence": net_event.confidence,
+            "pixel_count": net_event.pixel_count,
         }
         self.events.setdefault(self.frame_count, []).append(event)
-        self.last_event = self.frame_count
         logger.info(f"NET detected at frame {self.frame_count}, "
-                     f"confidence {net_event.confidence:.2f}")
+                     f"confidence {net_event.confidence:.2f}, "
+                     f"pixels={net_event.pixel_count}")  # DEBUG: Remove after diagnosis
         return event
 
     # ── Main per-frame entry point ───────────────────────────────────────
@@ -311,7 +361,7 @@ class EventDetector:
         new_events: List[Dict] = []
 
         # 1. CatBoost HIT / BOUNCE / OUT / SERVE_FAULT
-        if self.last_event + 7 <= self.frame_count:
+        if self.last_catboost_event + self.catboost_cooldown <= self.frame_count:
             new_events.extend(self._detect_catboost_events())
 
         # 2. Net-hit detection (independent cooldown inside NetDetector)
@@ -319,6 +369,9 @@ class EventDetector:
             net_evt = self._detect_net_hit(frame)
             if net_evt is not None:
                 new_events.append(net_evt)
+        else:
+            if self.net_detector is not None and self.frame_count <= 100:
+                logger.warning(f"Frame is None at frame {self.frame_count} - NET detection skipped!")  # DEBUG: Remove after diagnosis
 
         return new_events
 
@@ -336,23 +389,25 @@ class EventDetector:
                 pos = history_positions[frame_num]
                 if pos:
                     final_type = evt_type
-                    out_reason = None
-
-                    if evt_type == "BOUNCE":
-                        final_type, out_reason = self._classify_bounce(pos)
-
                     event: Dict = {
                         "frame": frame_num,
-                        "type": final_type,
+                        "type": None,  # Will be set based on classification
                         "position": pos,
                     }
-                    if out_reason:
-                        event["out_reason"] = out_reason
+
+                    if evt_type == "BOUNCE":
+                        # Get bounce metadata (in_bounds, serve_fault_type)
+                        bounce_classification = self._classify_bounce(pos)
+                        event["type"] = EVENT_BOUNCE  # Always send as BOUNCE
+                        event["in_bounds"] = bounce_classification["in_bounds"]
+                        event["serve_fault_type"] = bounce_classification["serve_fault_type"]
+                    else:
+                        event["type"] = evt_type
 
                     self.events.setdefault(frame_num, []).append(event)
                     new_events.append(event)
-                    self.last_event = self.frame_count
-                    logger.info(f"{final_type} detected at frame {frame_num}, "
+                    self.last_catboost_event = self.frame_count
+                    logger.info(f"{event['type']} detected at frame {frame_num}, "
                                 f"position {pos}")
         return new_events
 
@@ -362,9 +417,9 @@ class EventDetector:
         if self.model is None:
             return {}
 
-        if((x_ball, y_ball) == self.last_input):
+        if len(x_ball) == self.last_input:
             return {}
-        self.last_input = (x_ball, y_ball)
+        self.last_input = len(x_ball)
         x_smooth, y_smooth = self._smooth_predictions(x_ball, y_ball)
         features, valid_frames = self._prepare_features(x_smooth, y_smooth)
 
@@ -373,18 +428,26 @@ class EventDetector:
         probs = self.model.predict_proba(features)
 
         per_sample_max = np.max(probs, axis=1)
-        if np.max(per_sample_max) < self.threshold:
-            return {}
         preds = np.argmax(probs, axis=1)
+        
         events = {}
         for idx, cls in enumerate(preds):
+            # Confidence thresholding to reduce false positives
+            sample_confidence = per_sample_max[idx]
+            if sample_confidence < self.threshold:
+                logger.debug(f"Frame {valid_frames[idx]}: confidence {sample_confidence:.3f} below threshold {self.threshold}")
+                continue
+            
             if cls == 1:
                 events[valid_frames[idx]] = "HIT"
+                logger.info(f"HIT detected at frame {valid_frames[idx]}, confidence={sample_confidence:.3f}")
+                self.eventstring += "H"
             elif cls == 2:
                 events[valid_frames[idx]] = "BOUNCE"
-            if cls==1 or cls==2:
-                self.eventstring += events[valid_frames[idx]][0]
-                logger.info(self.eventstring+f" {np.max(probs)}")
+                logger.info(f"BOUNCE detected at frame {valid_frames[idx]}, confidence={sample_confidence:.3f}")
+                self.eventstring += "B"
+            
+            logger.debug(self.eventstring + f" (confidence={sample_confidence:.3f})")
 
         return events
 
@@ -473,12 +536,6 @@ class EventDetector:
                     x_ball[num] = x_ext
                     y_ball[num] = y_ext
                     is_none[num] = False 
-                    
-                    if not is_none[num + 1]:
-                        dist_val = distance.euclidean((x_ext, y_ext), (x_ball[num + 1], y_ball[num + 1]))
-                        if dist_val > 80:
-                            x_ball[num + 1], y_ball[num + 1] = None, None
-                            is_none[num + 1] = True
                     counter += 1
                 else:
                     counter = 0

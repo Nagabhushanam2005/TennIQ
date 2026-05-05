@@ -18,13 +18,13 @@ NET_HEIGHT_TO_WIDTH_RATIO = 3.0 / 36.0  # = 1/12
 
 # Default detector parameters (tunable, but most of these are bought after experimentation and should not be changed just like that)
 DEFAULT_WINDOW_SEC = 3.0
-DEFAULT_SPIKE_K = 5.5
-DEFAULT_EWMA_K = 5.8
-DEFAULT_REFRACTORY_SEC = 3.0
-DEFAULT_MIN_ABS_COUNT = 170
+DEFAULT_SPIKE_K = 4.5
+DEFAULT_EWMA_K = 5.0
+DEFAULT_REFRACTORY_SEC = 1.5
+DEFAULT_MIN_ABS_COUNT = 100
 DEFAULT_EWMA_ALPHA = 2 / 21
-DEFAULT_SPIKE_RATIO_THRESHOLD = 4.75
-DEFAULT_CONFIRMATION_DELAY = 5
+DEFAULT_SPIKE_RATIO_THRESHOLD = 4.0
+DEFAULT_CONFIRMATION_DELAY = 3
 
 @dataclass
 class NetHitEvent:
@@ -216,12 +216,12 @@ class NetDetector:
             if self.verbose > 0:
                 logger.info(f"Net region initialized: {self.net_region}")
         else:
-            # Fallback
+            # Fallback: narrow band to reduce false positives without court data
             self.net_region = NetRegion(
-                x1=0,
-                y1=h // 3,
-                x2=w,
-                y2=h // 2
+                x1=w // 4,
+                y1=int(h * 0.35),
+                x2=3 * w // 4,
+                y2=int(h * 0.45)
             )
             if self.verbose > 0:
                 logger.warning("Court detection unavailable, using fallback net region")
@@ -254,9 +254,9 @@ class NetDetector:
         if court_detector is not None:
             self.initialize_from_court_detector(court_detector, frame.shape)
         else:
-            # fallback
+            # fallback: narrow band to reduce false positives without court data
             h, w = frame.shape[:2]
-            self.net_region = NetRegion(x1=0, y1=h // 3, x2=w, y2=h // 2)
+            self.net_region = NetRegion(x1=w // 4, y1=int(h * 0.35), x2=3 * w // 4, y2=int(h * 0.45))
 
         self._initialize_threshold(frame)
         self._initialized = True
@@ -380,8 +380,9 @@ class NetDetector:
         
         for box in player_boxes:
             x1, y1, x2, y2 = box
+            # Use symmetric dilation to avoid over-masking net region
             cleaned[
-                max(0, y1 - d): min(h, y2 + 3 * d),
+                max(0, y1 - d): min(h, y2 + d),
                 max(0, x1 - d): min(w, x2 + d)
             ] = 0
         
@@ -437,8 +438,10 @@ class NetDetector:
         # Check pending hit confirmation after delay
         confirmed_event = self._check_pending_confirmation()
         
-        # Warm-up period
-        if len(self._raw_window) < 10:
+        # Warm-up period (reduced from 10 to catch early net hits)
+        if len(self._raw_window) < 5:
+            if self.verbose > 1:
+                logger.debug(f"Warm-up: {len(self._raw_window)}/5 frames collected")
             return confirmed_event
         
         # Gate 1: raw spike threshold
@@ -448,6 +451,11 @@ class NetDetector:
         
         gate1_raw_spike = signal_value > baseline + self.spike_k * std
         gate2_refractory = (idx - self._last_hit_frame) >= self.refractory_frames
+        
+        if self.verbose > 1:
+            threshold = baseline + self.spike_k * std
+            logger.debug(f"Gate1 check @ frame {idx}: signal={signal_value}, baseline={baseline:.1f}, "
+                        f"std={std:.1f}, threshold={threshold:.1f}, pass={gate1_raw_spike}")  # DEBUG: Remove after diagnosis
         
         if signal_value < self.min_abs_count:
             return confirmed_event
@@ -568,7 +576,7 @@ class NetDetector:
         # detector can at least initialise without crashing.
         if self.net_region is None:
             h, w = frame.shape[:2]
-            self.net_region = NetRegion(x1=0, y1=h // 3, x2=w, y2=h // 2)
+            self.net_region = NetRegion(x1=w // 4, y1=int(h * 0.35), x2=3 * w // 4, y2=int(h * 0.45))
             logger.debug(
                 "NetDetector: net_region was None; using fallback "
                 f"({self.net_region.x1},{self.net_region.y1},"

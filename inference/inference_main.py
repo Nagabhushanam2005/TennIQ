@@ -22,8 +22,7 @@ from inference.src.event_detection import EventDetector
 from inference.src.scoreboard import Scoreboard
 from inference.src.tennis_state_machine import Player
 
-# Root logger: ERROR by default so third-party libraries stay quiet.
-# Per-module loggers (set to INFO) are configured in _setup_file_logger().
+
 logging.basicConfig(level=logging.ERROR)
 logger = logging.getLogger(__name__)
 
@@ -135,7 +134,7 @@ class TennisAnalyzer:
         # Internal flag: court + net calibrated at least once
         self._court_calibrated: bool  = False
         # Retry court calibration every N frames until it succeeds
-        self._court_calib_retry_every: int  = 30   # retry interval in frames
+        self._court_calib_retry_every: int  = 5   # retry interval in frames
         self._court_calib_last_attempt: int = 0    # frame_count of last attempt
 
     # ------------------------------------------------------------------ #
@@ -250,34 +249,12 @@ class TennisAnalyzer:
     #  Court + net calibration
     # ------------------------------------------------------------------ #
 
-    def _calibrate_court_from_frame(self, frame: np.ndarray) -> bool:
-        """
-        Run court + net calibration on *frame* and propagate keypoints to
-        all downstream components.
-
-        Returns True if calibration succeeded, False otherwise.
-        Called once at startup and retried every _court_calib_retry_every
-        frames until it succeeds.
-        """
-        if self.court_detector is None:
-            return False
-
-        logger.info("CourtDetector: attempting calibration…")
-        keypoints = self.court_detector.detect(frame, use_resized=True, verbose=1)
-
-        if keypoints is None:
-            logger.warning(
-                "Court calibration FAILED on this frame — will retry in "
-                f"{self._court_calib_retry_every} frames."
-            )
-            # Still initialise NetDetector with a heuristic fallback so the
-            # pipeline does not crash while waiting for a successful calibration.
-            if self.net_detector is not None and not self.net_detector._initialized:
-                self.net_detector.initialize_from_frame(frame, court_detector=None)
-                logger.info("NetDetector: fallback initialisation (no court keypoints).")
-            return False
-
-        logger.info(f"Court calibration SUCCESS — {len(keypoints)} keypoints detected.")
+    def _apply_court_calibration(
+        self, keypoints: np.ndarray, frame: np.ndarray,
+    ) -> None:
+        """Propagate validated *keypoints* to all downstream components."""
+        # Store on the court_detector so get_keypoints() returns them
+        self.court_detector.keypoints = keypoints
 
         # ── Scoreboard: update frame dimensions + court bounds ─────────
         if self.scoreboard is not None:
@@ -311,19 +288,117 @@ class TennisAnalyzer:
             )
 
         self._court_calibrated = True
+
+    def _calibrate_court_from_frame(self, frame: np.ndarray) -> bool:
+        """
+        Run court + net calibration on *frame* and propagate keypoints to
+        all downstream components.
+
+        Returns True if calibration succeeded, False otherwise.
+        Called once at startup and retried every _court_calib_retry_every
+        frames until it succeeds.
+        """
+        if self.court_detector is None:
+            return False
+
+        logger.info("CourtDetector: attempting calibration…")
+        keypoints = self.court_detector.detect(frame, use_resized=True, verbose=1)
+
+        if keypoints is None:
+            logger.warning(
+                "Court calibration FAILED on this frame — will retry in "
+                f"{self._court_calib_retry_every} frames."
+            )
+            if self.net_detector is not None and not self.net_detector._initialized:
+                self.net_detector.initialize_from_frame(frame, court_detector=None)
+                logger.info("NetDetector: fallback initialisation (no court keypoints).")
+            return False
+
+        logger.info(f"Court calibration SUCCESS — {len(keypoints)} keypoints detected.")
+        self._apply_court_calibration(keypoints, frame)
         return True
 
     def _calibrate_court_from_video(self, cap: cv2.VideoCapture) -> None:
-        """Seek to frame 0, attempt calibration, then restore position."""
+        """
+        Multi-frame court calibration: detect keypoints on several frames
+        spread across the first part of the video, then take the per-keypoint
+        median to filter out outliers (e.g. a player occluding a court line).
+
+        Samples 5 frames at 10-frame intervals (frames 0, 10, 20, 30, 40).
+        A keypoint is accepted only if detected in at least 3 of the 5 frames.
+        Falls back to the per-frame retry mechanism if consensus fails.
+        """
         if not self.enable_court_tracking or self.court_detector is None:
             return
+
+        SAMPLE_COUNT = 5
+        FRAME_GAP = 10
+        MIN_AGREEMENT = 3
+
         saved_pos = cap.get(cv2.CAP_PROP_POS_FRAMES)
-        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-        ret, frame = cap.read()
-        if ret:
-            self._calibrate_court_from_frame(frame)
-        else:
-            logger.warning("CourtDetector: could not read first frame for calibration.")
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+        # Collect keypoint detections from multiple frames
+        all_detections: List[Optional[np.ndarray]] = []
+        sample_frame: Optional[np.ndarray] = None
+
+        for i in range(SAMPLE_COUNT):
+            frame_idx = i * FRAME_GAP
+            if total_frames > 0 and frame_idx >= total_frames:
+                break
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            ret, frame = cap.read()
+            if not ret:
+                logger.warning(
+                    f"CourtDetector: could not read frame {frame_idx} for calibration."
+                )
+                all_detections.append(None)
+                continue
+
+            if sample_frame is None:
+                sample_frame = frame
+
+            keypoints = self.court_detector.detect(frame, use_resized=True, verbose=0)
+            all_detections.append(keypoints)
+            status = f"{len(keypoints)} kp" if keypoints is not None else "FAILED"
+            logger.info(f"CourtDetector: frame {frame_idx} detection: {status}")
+
+        # Filter to successful detections
+        valid = [kp for kp in all_detections if kp is not None]
+        logger.info(
+            f"CourtDetector multi-frame: {len(valid)}/{len(all_detections)} "
+            f"frames returned keypoints."
+        )
+
+        if len(valid) < MIN_AGREEMENT:
+            logger.warning(
+                f"CourtDetector: fewer than {MIN_AGREEMENT} successful detections "
+                "— multi-frame calibration failed, will retry during playback."
+            )
+            if (
+                sample_frame is not None
+                and self.net_detector is not None
+                and not self.net_detector._initialized
+            ):
+                self.net_detector.initialize_from_frame(sample_frame, court_detector=None)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, saved_pos)
+            return
+
+        # Build consensus keypoints via per-index median
+        num_keypoints = valid[0].shape[0]  # 16
+        consensus = np.zeros((num_keypoints, 2), dtype=np.float32)
+        for idx in range(num_keypoints):
+            xs = np.array([kp[idx, 0] for kp in valid])
+            ys = np.array([kp[idx, 1] for kp in valid])
+            consensus[idx, 0] = np.median(xs)
+            consensus[idx, 1] = np.median(ys)
+
+        logger.info(
+            f"CourtDetector: consensus keypoints computed from "
+            f"{len(valid)} frames (median)."
+        )
+
+        self._apply_court_calibration(consensus, sample_frame)
         cap.set(cv2.CAP_PROP_POS_FRAMES, saved_pos)
 
     # ------------------------------------------------------------------ #
@@ -360,7 +435,14 @@ class TennisAnalyzer:
 
         # 1. Player tracking (must be synchronous)
         if self.enable_player_tracking and self.player_tracker is not None:
+            if not self.player_tracker.calibration_done:
+                logger.debug(f"Player calibration in progress (frame {self.frame_count} of {self.player_tracker.calibration_max_frames})")
             self.player_tracker.update(frame)
+            
+            # Log calibration completion
+            if self.player_tracker.calibration_done and not getattr(self, '_player_calib_logged', False):
+                logger.info(f"Player calibration completed at frame {self.frame_count}")
+                self._player_calib_logged = True
 
         # 2. Ball tracking (background)
         if self.enable_ball_tracking and self.ball_tracker is not None:
@@ -408,13 +490,17 @@ class TennisAnalyzer:
             history = self.ball_tracker.get_ball_history()
             if history:
                 raw = history[-1]
-                # Positions may be 2-tuple or 3-tuple (x, y[, flag])
-                ball_pos = (raw[0], raw[1]) if raw else None
+                # Positions may be 2-tuple, 3-tuple, or None
+                if raw is not None and len(raw) >= 2:
+                    ball_pos = (int(raw[0]), int(raw[1]))  # Extract just x, y
+                    logger.debug(f"Ball position: {ball_pos}, confidence={raw[2] if len(raw) > 2 else 'N/A'}")
 
-        # Player positions: {1: (x,y), 2: (x,y)}
+        # Player positions: {player_id: (x,y)}
         player_positions: Optional[Dict] = None
         if self.enable_player_tracking and self.player_tracker is not None:
             player_positions = self.player_tracker.get_player_positions()
+            if player_positions:
+                logger.debug(f"Player positions: {player_positions}")
 
         # One-shot: push court bounds to scoreboard once court is calibrated
         if (
@@ -669,7 +755,7 @@ class TennisAnalyzer:
 
         # Limit queue depth to avoid excessive memory use
         QUEUE_DEPTH = 4
-        analysis_pool  = ThreadPoolExecutor(max_workers=2)
+        analysis_pool  = ThreadPoolExecutor(max_workers=1)
         frame_queue: queue.Queue = queue.Queue()
         start_time      = time.time()
         processed       = 0

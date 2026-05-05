@@ -188,6 +188,16 @@ class Scoreboard:
                 if keypoints is not None and len(keypoints) >= 16:
                         net_y = int((keypoints[14][1] + keypoints[15][1]) / 2)
                         self.state_machine.set_net_y(net_y)
+                        logger.info(  # DEBUG: Remove after diagnosis
+                                f"[Scoreboard] Court bounds set: net_y={net_y}, "
+                                f"keypoints={len(keypoints)}"
+                        )
+                else:
+                        logger.warning(  # DEBUG: Remove after diagnosis
+                                f"[Scoreboard] Court bounds NOT set: "
+                                f"keypoints is None or length={len(keypoints) if keypoints is not None else 0} < 16. "
+                                f"Serve side detection may be incorrect!"
+                        )
 
         def update(
                 self,
@@ -207,12 +217,17 @@ class Scoreboard:
                                 position = event.get("position")
                                 frame = event.get("frame", self.frame_count)
                                 out_reason = event.get("out_reason")
+                                in_bounds = event.get("in_bounds")  # NEW: metadata for bounce events
+                                serve_fault_type = event.get("serve_fault_type")  # NEW: metadata for bounce events
 
                                 result = self.state_machine.process_event(
                                         event_type=event_type,
                                         position=position,
                                         frame=frame,
                                         out_reason=out_reason,
+                                        player_positions=player_positions,
+                                        in_bounds=in_bounds,
+                                        serve_fault_type=serve_fault_type,
                                 )
                                 msg = result.get("message", "")
                                 if msg:
