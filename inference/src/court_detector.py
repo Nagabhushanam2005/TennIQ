@@ -14,14 +14,6 @@ logger = logging.getLogger(__name__)
 class CourtDetector:
     """
     Detects 16 court keypoints by calling the bundled C++ executable.
-
-    Keypoint layout (see court-detector-cpp/Readme.md):
-      0-3   doubles court corners (TL, BL, BR, TR)
-      4-7   singles court corners (TL, BL, BR, TR)
-      8-9   top service line endpoints
-      10-11 bottom service line endpoints
-      12-13 centre service line endpoints
-      14-15 net endpoints (left, right)
     """
 
     _CPP_DETECTOR_DIR = Path(__file__).parent / "court-detector-cpp"

@@ -220,13 +220,16 @@ class PlayerTracker:
         """Selects the top 2 players after a temporary re-calibration, sorted by Y-position."""
         active_calib_trackers = [t for t in self.player_trackers if t.frames_lost < self.max_lost_frames]
         if active_calib_trackers:
-            # ISSUE #1 FIX: Sort by Y-coordinate (lower Y = rear/upper, higher Y = front/lower)
             active_calib_trackers.sort(key=lambda t: t.position_history[-1][1] if t.position_history else 0)
             self.active_players = active_calib_trackers[:self.max_players]
             logger.info(f"Re-calibration complete. Selected {len(self.active_players)} new active player(s) by Y-position.")
+            min_y = 10000
             for i, tracker in enumerate(self.active_players):
                 pos, _, _ = tracker.current_position()
-                position_label = "Rear (Upper)" if i == 0 else "Front (Lower)"
+                min_y = min(min_y, pos[1] if pos else min_y)
+            for i, tracker in enumerate(self.active_players):
+                pos, _, _ = tracker.current_position()
+                position_label = "Rear (Upper)" if pos[1]<=min_y else "Front (Lower)"
                 logger.info(f"  {position_label} Player: ID {tracker.player_id}, Position Y={pos[1] if pos else '?'}")
         else:
             logger.warning("Re-calibration failed to select any active players.")
